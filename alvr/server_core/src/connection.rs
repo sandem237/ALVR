@@ -774,6 +774,36 @@ fn connection_pipeline(
 
     let wired = client_ip.is_loopback();
 
+    let stream_protocol = if wired {
+        SocketProtocol::Tcp
+    } else {
+        initial_settings.connection.stream_protocol
+    };
+
+    // Bind the local stream socket before announcing the config, so the client can be told which
+    // port to send to. Port 0 lets the OS assign a free one per client, which is what allows
+    // several clients to stream at once: two sockets sharing a local port bind fine but do not
+    // receive on Windows. TCP needs no pre-bind and returns None.
+    let prebound_stream_socket = alvr_sockets::bind_server_stream_socket(
+        0,
+        stream_protocol,
+        initial_settings.connection.dscp,
+        initial_settings.connection.server_buffer_config,
+    )
+    .to_con()?;
+
+    let server_stream_port = match prebound_stream_socket.as_ref() {
+        Some(socket) => match socket.local_addr() {
+            Ok(address) => Some(address.port()),
+            Err(e) => con_bail!("Failed to read stream socket port: {e}"),
+        },
+        None => None,
+    };
+
+    if let Some(port) = server_stream_port {
+        dbg_connection!("connection_pipeline: stream socket bound on port {port}");
+    }
+
     dbg_connection!("connection_pipeline: send streaming config");
     let stream_config_packet = StreamConfigPacket::new(
         session_manager_lock.session(),
@@ -787,7 +817,7 @@ fn connection_pipeline(
             wired,
             ext_str: String::new(),
         }
-        .with_ext(NegotiatedStreamingConfigExt {}),
+        .with_ext(NegotiatedStreamingConfigExt { server_stream_port }),
     )
     .to_con()?;
 
@@ -820,17 +850,12 @@ fn connection_pipeline(
         }
     }
 
-    let stream_protocol = if wired {
-        SocketProtocol::Tcp
-    } else {
-        initial_settings.connection.stream_protocol
-    };
-
     dbg_connection!("connection_pipeline: Finishing handshake");
     let mut socket = SocketConnection::from_client_connection(
         socket,
         HANDSHAKE_ACTION_TIMEOUT,
         stream_config_packet,
+        prebound_stream_socket,
         StreamSocketConfig {
             protocol: stream_protocol,
             port: initial_settings.connection.stream_port,
@@ -1329,7 +1354,7 @@ fn connection_pipeline(
                     ClientControlPacket::Log { level, message } => {
                         info!("Client {client_hostname}: [{level:?}] {message}")
                     }
-                    ClientControlPacket::KeepAlive | ClientControlPacket::StreamReady => (),
+                    ClientControlPacket::KeepAlive | ClientControlPacket::StreamReady { .. } => (),
                     ClientControlPacket::ProximityState(headset_is_worn) => {
                         ctx.events_sender
                             .send(ServerCoreEvent::ProximityState {

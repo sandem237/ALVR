@@ -36,6 +36,9 @@ struct Args {
     /// Control port this instance listens on. Must be unique per instance on one machine, since
     /// the well-known CONTROL_PORT can only be bound once.
     control_port: u16,
+    /// Stream port this instance listens on. Also must be unique per instance, for the same reason.
+    /// 0 lets the OS pick a free one, which is the easy default for multi-instance runs.
+    stream_port: u16,
     view_resolution: UVec2,
     refresh_rate: f32,
     /// Exit automatically after this many seconds. Useful for scripted tests.
@@ -48,6 +51,8 @@ impl Args {
     fn parse() -> Result<Self, String> {
         let mut hostname = None;
         let mut control_port = alvr_sockets::CONTROL_PORT;
+        // 0 = OS-assigned, so concurrent instances never collide.
+        let mut stream_port = 0;
         let mut width = 1920;
         let mut height = 1832;
         let mut refresh_rate = 72.0;
@@ -69,6 +74,9 @@ impl Args {
                 "--hostname" => hostname = Some(next("--hostname")?),
                 "--control-port" => {
                     control_port = next("--control-port")?.parse().map_err(|e| format!("{e}"))?
+                }
+                "--stream-port" => {
+                    stream_port = next("--stream-port")?.parse().map_err(|e| format!("{e}"))?
                 }
                 "--width" => width = next("--width")?.parse().map_err(|e| format!("{e}"))?,
                 "--height" => height = next("--height")?.parse().map_err(|e| format!("{e}"))?,
@@ -113,6 +121,7 @@ impl Args {
         Ok(Self {
             hostname,
             control_port,
+            stream_port,
             view_resolution: UVec2::new(width, height),
             refresh_rate,
             run_for,
@@ -132,6 +141,8 @@ Options:
   --hostname <NAME>        Identity reported to the server (required, must be unique)
   --control-port <PORT>    Control port to listen on (default 9943). Must be unique per
                            instance, since only one process can bind a given port.
+  --stream-port <PORT>     Stream port to listen on (default 0 = OS-assigned, which is
+                           what you want for concurrent instances).
   --width <PX>             Per-eye width (default 1920)
   --height <PX>            Per-eye height (default 1832)
   --refresh-rate <HZ>      Preferred refresh rate (default 72)
@@ -207,6 +218,7 @@ fn main() -> ExitCode {
     unsafe {
         env::set_var("ALVR_CLIENT_HOSTNAME", &args.hostname);
         env::set_var("ALVR_CLIENT_CONTROL_PORT", args.control_port.to_string());
+        env::set_var("ALVR_CLIENT_STREAM_PORT", args.stream_port.to_string());
         env::set_var(
             "ALVR_CLIENT_CONFIG_DIR",
             env::temp_dir()

@@ -246,27 +246,49 @@ fn connection_pipeline(
         settings.connection.stream_protocol
     };
 
-    dbg_connection!("connection_pipeline: create StreamSocket");
+    // Test tooling can move this off the configured port so several emulated clients can run on one
+    // machine. Real clients leave it unset, since each has its own IP.
+    let client_stream_port = env::var("ALVR_CLIENT_STREAM_PORT")
+        .ok()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(settings.connection.stream_port);
+
+    dbg_connection!("connection_pipeline: create StreamSocket on port {client_stream_port}");
     let stream_socket_builder = StreamSocketBuilder::listen_for_server(
         Duration::from_secs(1),
-        settings.connection.stream_port,
+        client_stream_port,
         stream_protocol,
         settings.connection.dscp,
         settings.connection.client_buffer_config,
     )
     .to_con()?;
 
-    dbg_connection!("connection_pipeline: Send StreamReady");
-    if let Err(e) = control_sender.send(&ClientControlPacket::StreamReady) {
+    // Report the port actually bound, not the requested one: with port 0 the OS picks it.
+    let bound_stream_port = stream_socket_builder
+        .local_port()
+        .unwrap_or(client_stream_port);
+
+    dbg_connection!("connection_pipeline: Send StreamReady (port {bound_stream_port})");
+    if let Err(e) = control_sender.send(&ClientControlPacket::StreamReady {
+        stream_port: Some(bound_stream_port),
+    }) {
         info!("Server disconnected. Cause: {e:?}");
         set_hud_message(&event_queue, SERVER_DISCONNECTED_MESSAGE);
         return Ok(());
     }
 
-    dbg_connection!("connection_pipeline: accept connection");
+    // The server allocates a local port per client when it serves several at once, so send to the
+    // port it reported rather than assuming the configured one.
+    let server_stream_port = negotiated_config
+        .ext()
+        .ok()
+        .and_then(|ext| ext.server_stream_port)
+        .unwrap_or(settings.connection.stream_port);
+
+    dbg_connection!("connection_pipeline: accept connection on server port {server_stream_port}");
     let mut stream_socket = stream_socket_builder.accept_from_server(
         server_ip,
-        settings.connection.stream_port,
+        server_stream_port,
         settings.connection.packet_size as _,
         HANDSHAKE_ACTION_TIMEOUT,
     )?;

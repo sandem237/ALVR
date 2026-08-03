@@ -147,6 +147,17 @@ pub struct StreamSocketConfig {
     pub dscp: Option<DscpTos>,
 }
 
+/// Binds the server's local stream socket up front, so the port it will send from can be given to
+/// the client during the handshake. See [`StreamSocketBuilder::bind_server_stream_socket`].
+pub fn bind_server_stream_socket(
+    port: u16,
+    protocol: SocketProtocol,
+    dscp: Option<DscpTos>,
+    buffer_config: SocketBufferConfig,
+) -> Result<Option<std::net::UdpSocket>> {
+    StreamSocketBuilder::bind_server_stream_socket(port, protocol, dscp, buffer_config)
+}
+
 pub enum ServerConnectionResult {
     Connected(SocketConnection),
     Restarting,
@@ -163,6 +174,8 @@ impl SocketConnection {
         mut control_socket: ProtoControlSocket,
         timeout: Duration,
         stream_config_packet: impl Serialize,
+        // Bound before the config was sent, so the client already knows which port to send to.
+        prebound_stream_socket: Option<std::net::UdpSocket>,
         socket_config: StreamSocketConfig,
     ) -> ConResult<Self> {
         let client_ip = control_socket.inner.peer_addr().to_con()?.ip();
@@ -173,19 +186,24 @@ impl SocketConnection {
             .send(&ServerControlPacket::StartStream)
             .to_con()?;
 
-        let signal = control_socket.recv(timeout)?;
-        if !matches!(signal, ClientControlPacket::StreamReady) {
-            con_bail!("Got unexpected packet waiting for stream ack");
-        }
+        // The client reports the port it is actually listening on, which differs from the configured
+        // one when several clients share an address.
+        let client_stream_port = match control_socket.recv(timeout)? {
+            ClientControlPacket::StreamReady { stream_port } => {
+                stream_port.unwrap_or(socket_config.port)
+            }
+            _ => con_bail!("Got unexpected packet waiting for stream ack"),
+        };
 
         let stream_socket = StreamSocketBuilder::connect_to_client(
             timeout,
             client_ip,
-            socket_config.port,
+            client_stream_port,
             socket_config.protocol,
             socket_config.dscp,
             socket_config.buffer_config,
             socket_config.max_packet_size,
+            prebound_stream_socket,
         )?;
 
         Ok(Self {
@@ -218,7 +236,9 @@ impl SocketConnection {
         .to_con()?;
 
         control_socket
-            .send(&ClientControlPacket::StreamReady)
+            .send(&ClientControlPacket::StreamReady {
+                stream_port: Some(socket_config.port),
+            })
             .to_con()?;
 
         let stream_socket = stream_socket_builder.accept_from_server(

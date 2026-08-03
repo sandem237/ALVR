@@ -75,9 +75,16 @@ pub enum ClientConnectionResult {
     ClientStandby,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct NegotiatedStreamingConfigExt {
-    // Nothing for now
+    /// The UDP port the server actually sends the stream from.
+    ///
+    /// Normally this is the configured `stream_port`, but when the server serves several clients at
+    /// once it allocates one local port per client, because two sockets sharing a local port do not
+    /// receive on Windows. `None` means "use the configured `stream_port`", which keeps older
+    /// clients working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_stream_port: Option<u16>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -101,11 +108,16 @@ impl ClientNegotiatedStreamingConfig {
     }
 
     pub fn ext(&self) -> Result<NegotiatedStreamingConfigExt> {
-        let _ext_json = json::from_str::<json::Value>(&self.ext_str)?;
+        let ext_json = json::from_str::<json::Value>(&self.ext_str)?;
 
-        // decode values here
-
-        Ok(NegotiatedStreamingConfigExt {})
+        // Decoded field by field rather than deserialized wholesale, so an unknown or missing field
+        // from a mismatched peer degrades to the default instead of failing the whole handshake.
+        Ok(NegotiatedStreamingConfigExt {
+            server_stream_port: ext_json
+                .get("server_stream_port")
+                .and_then(|port| port.as_u64())
+                .and_then(|port| u16::try_from(port).ok()),
+        })
     }
 }
 
@@ -188,7 +200,13 @@ pub enum ClientControlPacket {
     PlayspaceSync(Option<Vec2>),
     RequestIdr,
     KeepAlive,
-    StreamReady, // This flag notifies the server the client streaming socket is ready listening
+    /// Notifies the server that the client streaming socket is listening.
+    ///
+    /// `stream_port` is the port it is listening on, so that several clients behind one address can
+    /// each use a different one. `None` means the configured `stream_port`.
+    StreamReady {
+        stream_port: Option<u16>,
+    },
     LocalViewParams([ViewParams; 2]), // In relation to head
     Battery(BatteryInfo),
     Buttons(Vec<ButtonEntry>),

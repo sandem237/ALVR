@@ -246,6 +246,15 @@ pub enum StreamSocketBuilder {
 }
 
 impl StreamSocketBuilder {
+    /// The local port actually bound. Needed when binding port 0, since the OS picks the port and
+    /// the peer has to be told the real one.
+    pub fn local_port(&self) -> Result<u16> {
+        Ok(match self {
+            StreamSocketBuilder::Udp(socket) => socket.local_addr()?.port(),
+            StreamSocketBuilder::Tcp(listener) => listener.local_addr()?.port(),
+        })
+    }
+
     pub fn listen_for_server(
         timeout: Duration,
         port: u16,
@@ -266,16 +275,18 @@ impl StreamSocketBuilder {
         })
     }
 
+    /// `server_stream_port` is the port the server actually sends from, which differs from the
+    /// configured `stream_port` when the server allocates one per client to serve several at once.
     pub fn accept_from_server(
         self,
         server_ip: IpAddr,
-        port: u16,
+        server_stream_port: u16,
         max_packet_size: usize,
         timeout: Duration,
     ) -> ConResult<StreamSocket> {
         let (send_socket, receive_socket) = match self {
             StreamSocketBuilder::Udp(socket) => {
-                udp::connect(&socket, server_ip, port, timeout).to_con()?;
+                udp::connect(&socket, server_ip, server_stream_port, timeout).to_con()?;
                 udp::split_multiplexed(socket, max_packet_size).to_con()?
             }
             StreamSocketBuilder::Tcp(listener) => {
@@ -291,6 +302,27 @@ impl StreamSocketBuilder {
         })
     }
 
+    /// Pre-binds the server's local UDP socket so its port is known before the stream config is
+    /// sent to the client.
+    ///
+    /// Serving several clients at once needs one local port per client: two sockets sharing a local
+    /// port bind fine but do not receive on Windows, which does not demultiplex connected UDP
+    /// sockets the way Linux `SO_REUSEPORT` does. Binding port 0 lets the OS assign a free port,
+    /// which the client is then told to send to.
+    ///
+    /// Returns `None` for TCP, which needs no pre-bind (it does not bind a local port at all).
+    pub fn bind_server_stream_socket(
+        port: u16,
+        protocol: SocketProtocol,
+        dscp: Option<DscpTos>,
+        buffer_config: SocketBufferConfig,
+    ) -> Result<Option<UdpSocket>> {
+        match protocol {
+            SocketProtocol::Udp => Ok(Some(udp::bind_reusable(port, dscp, buffer_config)?)),
+            SocketProtocol::Tcp => Ok(None),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn connect_to_client(
         timeout: Duration,
@@ -300,12 +332,15 @@ impl StreamSocketBuilder {
         dscp: Option<DscpTos>,
         buffer_config: SocketBufferConfig,
         max_packet_size: usize,
+        // A socket already bound by `bind_server_stream_socket`, whose port the client was told.
+        prebound_socket: Option<UdpSocket>,
     ) -> ConResult<StreamSocket> {
         let (send_socket, receive_socket) = match protocol {
             SocketProtocol::Udp => {
-                // Reusable so that several clients can be served from the same local stream port.
-                // Each socket is connected to one client, so datagrams still demultiplex per client.
-                let socket = udp::bind_reusable(port, dscp, buffer_config).to_con()?;
+                let socket = match prebound_socket {
+                    Some(socket) => socket,
+                    None => udp::bind_reusable(port, dscp, buffer_config).to_con()?,
+                };
                 udp::connect(&socket, client_ip, port, timeout).to_con()?;
                 udp::split_multiplexed(socket, max_packet_size).to_con()?
             }
