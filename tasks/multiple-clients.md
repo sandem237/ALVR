@@ -144,29 +144,99 @@ measured: `CreateFileMapping` in `Global\` fails `ACCESS_DENIED` even with a def
 control channel is a pipe, and any shared memory / event / texture names must be negotiated over that
 pipe and created wherever both sides can reach them. Resolve per object type rather than assuming.
 
-### Frame path: still to determine per object type
+### Frame path — RESOLVED: the service owns the texture
 
-The control channel is settled (service-created `Global\` pipe, app connects outward). The **frame
-path is not**, because section/texture objects do not behave like pipes:
+The service creates the named shared D3D11 texture and the app opens it. Verified two ways: an
+AppContainer-simulated child (Spike 2) and a **genuine packaged UWP app** writing `0xAAAAAAAA` into a
+service-owned texture (Spike 5).
 
-- Creating a section or event in `Global\` needs `SeCreateGlobalPrivilege`, which an unelevated
-  service does not have. Measured: `CreateFileMapping` in `Global\` fails `ACCESS_DENIED` from an
-  unelevated unpackaged process even with a default DACL.
-- An earlier spike *did* show a service-created **named DXGI shared texture**
-  (`CreateSharedHandle` + `OpenSharedResourceByName`, `SHARED_NTHANDLE | SHARED_KEYEDMUTEX`, ACL'd)
-  being opened by an AppContainer-simulated child. DXGI shared handles are validated differently from
-  section objects, so that result does not transfer automatically — but it also is not contradicted.
-- Ridge/asgard goes the other way for its texture: the in-container client creates it with a bare name
-  and the desktop adapter opens it via a `GetAppContainerNamedObjectPath`-resolved root
-  (`SimulatedRealityRemoteSession::EnsureResources`). That direction is proven in production.
+The earlier doubt came from over-generalising one measurement. `SeCreateGlobalPrivilege` gates **only
+file-mappings and symbolic links**, and only on *creation*, never on opening
+([Kernel object namespaces](https://learn.microsoft.com/en-us/windows/win32/termserv/kernel-object-namespaces)).
+Measured unelevated, with no `SeCreateGlobalPrivilege` on the token at all:
 
-So both directions have some evidence. **Decide by measuring the real packaged UWP app against a
-service-created shared texture** (the probe already has this case wired) before committing. If the
-service cannot own the texture, idle "no signal" video needs a rethink, since the surface would only
-exist while an app does.
+| Object in `Global\` | Unelevated result |
+|---|---|
+| `CreateFileMapping` (section) | **ACCESS_DENIED** |
+| `CreateEvent`, `CreateMutex` | OK |
+| `CreateNamedPipe` | OK |
+| Event / pipe **with an `S-1-15-2-1` ACL** | OK |
 
-Whichever direction wins, the negotiated object names should be exchanged over the pipe rather than
-hardcoded — which is what SteamVR does with its "received namespace data" handshake.
+So only `Global\` **sections** are restricted. Pipes and DXGI shared textures are not, which is why the
+control channel and the frame path both work from an unelevated, unpackaged service.
+
+Practical rule: if a service-owned named **shared-memory block** is ever needed, use a non-`Global\`
+name; DXGI textures are unaffected.
+
+Consequence: **idle "no signal" video works as originally designed** — the service can own the texture
+before any app exists.
+
+### How SteamVR does the same thing (read off a live install)
+
+Worth recording, because it independently validates this design and answers "SteamVR does it, how?".
+
+- `vrserver.exe` runs as a **normal non-elevated user**; there is no SteamVR Windows service. So
+  elevation and SYSTEM are *not* required.
+- `vrclient_x64.dll` (which *is* the OpenXR runtime, per `steamxr_win64.json`) contains
+  `CreateWellKnownSid` + **`WinBuiltinAnyPackageSid`** (`S-1-15-2-1`) and `AddAccessAllowedAce`.
+- The live pipe `\.\pipe\SteamVR_Namespace` carries `...(A;;FA;;;AC)S:AI(ML;;NW;;;S-1-16-0)` — i.e.
+  ALL_APPLICATION_PACKAGES **plus an Untrusted integrity label**, so even low-IL sandboxes pass. The
+  "SteamVR needs to set itself up for App Containers" prompt is this ACL work.
+- The app therefore **reaches outward** to the already-running service; no PID handshake, no launching.
+- Per-session object names are then negotiated over that channel, not hardcoded:
+  `CSharedResourceNamespaceClient::Init()` logs "failed connect", "failed to get server response",
+  "received namespace data %u", and "Unable to create shared state %s because namespace wasn't
+  available". **Copy this**: exchange object names over the pipe.
+- Consider declaring **`XR_EXT_win32_appcontainer_compatible`**, which `vrclient_x64.dll` exports.
+  Chromium (the useful open-source reference here — Monado has no UWP story) adds no XR-specific
+  sandbox rules and instead relies on the runtime honouring that extension by ACLing its own
+  resources. SteamVR also exposes `VRInitError_Init_NoServerForAppContainer` for the failure case.
+- Also verified: the OpenXR **loader works inside a real AppContainer** — `HKLM\SOFTWARE` grants `KR`
+  to `AC` by inheritance, so a sandboxed probe read `ActiveRuntime`, read the manifest, and
+  `LoadLibrary`'d the runtime DLL. SteamVR additionally stamps `(A;;0x1200a9;;;AC)` on the DLL.
+- For contrast, the Windows Mixed Reality runtime *is* a LocalSystem service using COM/RPC rather than
+  named objects — a different mechanism, and evidence that SYSTEM is one option but not a requirement.
+
+### What our runtime must do to be AppContainer-compatible
+
+The loader chain has **three independent failure points**, and the extension covers only the third.
+Nothing in any spec assigns responsibility for the first two, so they are ours to handle:
+
+1. **Registry read** of `HKLM\SOFTWARE\Khronos\OpenXR\1\ActiveRuntime`. The loader opens it with
+   `KEY_QUERY_VALUE`, **HKLM only, no HKCU fallback** (`manifest_file.cpp`
+   `ReadRuntimeDataFilesInRegistry`). Works in a normal AppContainer through inherited `S-1-15-2-1`
+   read access — **but fails under LPAC** without the `registryRead` capability.
+2. **`LoadLibraryW`** on the absolute, out-of-package path from the runtime JSON. Governed purely by
+   the ACLs on our DLL *and every parent directory*. So **our installer must grant read+execute to
+   `S-1-15-2-1` on the install tree** — exactly what SteamVR's elevated "set itself up for App
+   Containers" prompt does (`removeusbhelper.exe enableappcontainers`).
+3. **Our own IPC ACLs** — the only thing `XR_EXT_win32_appcontainer_compatible` actually mandates.
+
+`XR_EXT_win32_appcontainer_compatible` (ext 58, rev 1, Microsoft-authored, in OpenXR 1.0.6) adds **no
+functions, structs or enums** — it is purely a negotiation with one normative sentence: *"the runtime
+must properly set ACL to device resources and cross process resources"*, plus two error contracts:
+- return `XR_ERROR_EXTENSION_NOT_PRESENT` from `xrCreateInstance` if we cannot honour it;
+- return `XR_ERROR_FORM_FACTOR_UNAVAILABLE` from `xrGetSystem` if the specific device cannot.
+
+Chromium **requires** it whenever sandboxed — `openxr_platform_helper_windows.cc` checks
+`TokenIsAppContainer` and unconditionally adds the extension name, letting those two error returns fail
+the runtime out. Its XR container gets only `kRegistryRead`, `kChromeInstallFiles`,
+`kLpacChromeInstallFiles`, `kLpacPnpNotifications`, and is explicitly **not** LPAC
+(`// Note: does not use LPAC.` in `sandbox_win.cc`), which is why `S-1-15-2-1` ACLs work there.
+
+Derived requirements for `alvr_openxr` / `alvr_service`:
+- **Advertise the extension** and accept it at `xrCreateInstance`; honour both error contracts.
+- **ACL the install tree** (DLL + manifest + parents) for `S-1-15-2-1` from an elevated installer step.
+- **ACL the control pipe and any shared objects** for app packages — already done for the pipe.
+- **Do not require registry writes**; the container has read-only registry access.
+- **Never try to launch the service** from the app — an AppContainer cannot. Fail fast with a
+  distinguishable error. SteamVR added `VRInitError_Init_NoServerForAppContainer` for exactly this, and
+  separately had to fix a *hang* when the server was absent. Our runtime should return promptly rather
+  than blocking on a connect retry loop.
+- Consider an **Untrusted integrity label** (`S:AI(ML;;NW;;;S-1-16-0)`) on the pipe as SteamVR does, so
+  even low-IL sandboxes pass.
+- Note the name string is lowercase `"XR_EXT_win32_appcontainer_compatible"` while the macro is
+  uppercase; do not uppercase before comparing.
 
 
 ### Device registry
