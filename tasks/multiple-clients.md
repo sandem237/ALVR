@@ -43,46 +43,9 @@ app launch/exit renegotiates the whole ALVR connection (handshake, resolution, d
 seconds of black screen per transition. With it, the headset never disconnects and app switching is
 just a texture-source swap. The idle texture is static, so it costs one image and a low-rate encode.
 
-Confirmed feasible by Spike 2: the service can create and own the texture before any app exists, and a
+Whether the *service* can own the idle texture is still open: see "Frame path" below. If the
+texture must instead be created by the app, idle content needs a different source.
 later-starting app can still attach to it by name.
-
-### IPC: control channel — ownership must be INVERTED for sandboxed UWP
-
-**The app creates the pipe; the service connects into it.** This is the opposite of the obvious
-"service listens" shape, and it is forced by AppContainer rules:
-
-- A sandboxed UWP app **cannot connect outward** to a desktop service's pipe. `CreateFile2` docs:
-  *"When called from a Windows Store app… **You can't open named pipes**."* And `ConnectNamedPipe`
-  docs: *"Windows 10, version 1709 and later: … named pipes within app-containers must use the syntax
-  `\\.\pipe\LOCAL\`"*, a namespace aliased per container.
-- A sandboxed UWP app **can create** a pipe server in its own namespace, and a desktop process can
-  connect to it by fully-qualified path — the same ownership direction the SimulatedReality reference
-  uses for its shared texture.
-
-Working reference: `github.com/hannesne/NamedPipesSample` ("Previously unsuccessful experiments to use
-named pipes in UWP. Can now use them to communicate between a console app and a UWP app").
-- UWP side: `NamedPipeServerStream` on `LOCAL\mypipe`.
-- Desktop side: `NamedPipeClientStream` on
-  `Sessions\{SessionId}\AppContainerNamedObjects\{PackageSid}\mypipe`.
-
-Consequence for us: the app must publish its **PID**, from which the service resolves the namespace
-root with `GetAppContainerNamedObjectPath`. Ridge solves this by **protocol/URI activation** —
-`ridge-sr-driver://connect?pid=1234` — which launches the desktop adapter and hands it the PID in one
-step. That is the rendezvous, and it is confirmed working in production.
-
-For ALVR the service is already running, so it does not need launching. The app still has to announce
-itself; options, cheapest first:
-1. The app writes its PID somewhere the service already watches (e.g. a file in a known location, or
-   the existing web API — the runtime can do an HTTP POST even from a sandbox with
-   `privateNetworkClientServer`).
-2. The orchestrator, which launches the app anyway, tells the service the PID it just spawned.
-3. Protocol activation of a tiny per-app broker, mirroring Ridge exactly.
-
-Option 2 fits the design best: the orchestrator already knows the PID because it started the app, and
-it is already a control-API client. **Decide before implementing.**
-
-Note the reference sample declares `runFullTrust`, so it does not by itself prove the fully sandboxed
-case; but the *direction* it demonstrates is what AppContainer rules require.
 
 ### IPC: control channel — mechanics (independent of direction)
 
@@ -132,65 +95,79 @@ Why not loopback TCP: the UWP loopback mechanism (`windows.loopbackAccessRules`)
 fallback would be machine-wide `checknetisolation loopbackexempt`, requiring admin and manual upkeep.
 Pipes need one ACL'd object instead.
 
-### IPC: ownership direction — SETTLED, and it is the opposite of my first design
+### IPC: control channel — MEASURED, and the simple design works
 
-> **The sandboxed (AppContainer) side CREATES every shared object. The full-trust desktop side OPENS
-> them, resolving the path from the app's PID.**
+> **The service creates the pipe in `Global\` with an `S-1-15-2-1` ACL; a sandboxed UWP app connects
+> outward to it with `CreateFile2`. No PID rendezvous, no launching, no elevation.**
 
-Confirmed against Ridge/asgard production code, where the main app genuinely runs in an AppContainer:
-`SimulatedRealityRemoteSession::EnsureResources` (the **client**, inside the container) constructs the
-shared texture with a bare `SharedResourceName`; the **adapter** (a separately installed desktop app,
-launched by protocol invocation carrying the PID) opens it via
-`GetAppContainerNamedObjectPath`-resolved root.
+Measured, not inferred. Host is **unpackaged and unelevated**; client is a **genuinely sandboxed**
+packaged UWP app (no `runFullTrust`, no declared capabilities):
 
-Why this direction and not the other:
+```
+[host] pipe : *** UWP CONNECTED *** "pipe from UWP pid 49648"
+```
 
-- A bare name created inside the container lands in the container's own object directory, where it has
-  full rights — so **no ACL code is needed at all**. This is why there is no SDDL anywhere in Ridge.
-- Pushing the other way does not work. Measured: an unelevated, unpackaged desktop process cannot even
-  `CreateFileMapping` for the app to open (`ACCESS_DENIED`), and `Global\` for sections/events needs
-  `SeCreateGlobalPrivilege` that a plain service lacks. (Pipes differ: there `Global\` is just part of
-  the name and needs no privilege.)
-- It also explains why the adapter exists as a separate desktop process at all, and why it is started
-  by URI with the PID: the app owns the objects, so the desktop side must be *told where to look*.
+And the negative control holds: without the `S-1-15-2-1` grant the same open fails
+`ACCESS_DENIED (0x80070005)`. So the ACL is what permits it.
 
-Correction to earlier notes in this file: an earlier spike appeared to show "service creates, app
-opens" working, but that used an AppContainer-*simulated* child process and a DXGI shared handle, not
-a genuine packaged UWP app and not a section object. Ridge's direction is the one that holds in a real
-sandbox.
+This directly contradicts the `CreateFile2` documentation (*"You can't open named pipes"*).
+**The measurement wins.** That MSDN wording appears to be outdated — it predates a good deal of
+AppContainer evolution, and this is not the only case where documented UWP restrictions no longer
+match shipping behaviour.
 
-Consequence for the idle "no signal" texture: the service can no longer own the texture, because it
-only exists while an app does. Idle content must therefore either be dropped (model **(b)**: stream
-stays connected, no content until an app attaches) or produced by a small always-running full-trust
-helper that owns its own surface. **Revisit this decision.**
+**Working rule for this project: verify with a test, and do not let a doc sentence overturn a passing
+measurement.** Reversing a verified result on the strength of documentation cost a long detour here.
+Where docs and measurement disagree, record both and trust the test.
 
-### IPC: frame path (superseded — see ownership direction above)
+(A plausible reconciliation, for what it is worth: the restriction likely concerns the `LOCAL\`
+namespace rules for pipes *created inside* a container, not *opening* a `Global\` pipe whose ACL
+admits app packages — consistent with the separate finding that for **pipes** `Global\` is only part of
+the name and needs no `SeCreateGlobalPrivilege`.)
 
-Originally planned as **service creates the shared texture, app opens it**, for these reasons:
+Independent support from SteamVR, which does exactly this (already running, does not launch the app,
+app starts later). Strings in its runtime `vrclient_x64.dll`:
 
-- The idle texture must exist *before* any app does, which only works if the service owns it.
-- The service knows the headset's negotiated resolution, so it should define the texture size. This
-  matches OpenXR anyway, where `xrEnumerateViewConfigurationViews` returns runtime-chosen sizes.
-- An already-running app *can* be granted access, because named shared resources are ACL-checked at
-  open time, not granted to a specific process at creation. So a later-starting app still works.
+```
+CSharedResourceNamespaceClient::Init(): failed connect
+CSharedResourceNamespaceClient::Init(): failed to get server response
+CSharedResourceNamespaceClient::Init(): received namespace data %u
+-Unable to create shared state %s because namespace wasn't available
+```
 
-Mechanics:
-- Create: `D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`, then
-  `IDXGIResource1::CreateSharedHandle(&security_attributes, access, name, &handle)`. Retain the handle
-  only to keep the name alive. Pass real `SECURITY_ATTRIBUTES` (the reference passes `nullptr`).
-- Open: `ID3D11Device1::OpenSharedResourceByName(name, access, ...)`.
-- **Check the HRESULT and match access flags.** The reference opens `Read|Write` a texture created
-  `SharedRead`-only and gets away with it solely because it ignores the HRESULT. Do not copy that.
-- **D3D11 only.** D3D12/Vulkan have no named-resource equivalent and would need real handle transport
-  (`DuplicateHandle` + `PROCESS_DUP_HANDLE`). Keeping a D3D11 interop surface avoids all of it.
+The runtime **connects outward to the running server and is told the namespace to use** — it does not
+hardcode one. That is the pattern to copy: connect over the well-known ACL'd channel, then learn
+per-session object names from the service.
 
-Sync: **two-key keyed-mutex ping-pong** over a single texture. One side acquires/releases `{0,1}`, the
-other `{1,0}`, so each releases with the key the peer waits on and access strictly alternates.
-Consumer uses a short timeout and reuses its previous local copy on failure — graceful degradation
-instead of a frame hitch — and blits immediately to a local texture to minimise lock hold time.
+**Important caveat that shaped this investigation:** section objects and events are *not* like pipes.
+Creating either in `Global\` needs `SeCreateGlobalPrivilege`, which an unelevated service lacks —
+measured: `CreateFileMapping` in `Global\` fails `ACCESS_DENIED` even with a default DACL. So the
+control channel is a pipe, and any shared memory / event / texture names must be negotiated over that
+pipe and created wherever both sides can reach them. Resolve per object type rather than assuming.
 
-Robustness idioms to copy: wait jointly on the peer's **process handle and** a shutdown event; treat a
-keyed-mutex acquire failure as "reopen the shared resource", not fatal.
+### Frame path: still to determine per object type
+
+The control channel is settled (service-created `Global\` pipe, app connects outward). The **frame
+path is not**, because section/texture objects do not behave like pipes:
+
+- Creating a section or event in `Global\` needs `SeCreateGlobalPrivilege`, which an unelevated
+  service does not have. Measured: `CreateFileMapping` in `Global\` fails `ACCESS_DENIED` from an
+  unelevated unpackaged process even with a default DACL.
+- An earlier spike *did* show a service-created **named DXGI shared texture**
+  (`CreateSharedHandle` + `OpenSharedResourceByName`, `SHARED_NTHANDLE | SHARED_KEYEDMUTEX`, ACL'd)
+  being opened by an AppContainer-simulated child. DXGI shared handles are validated differently from
+  section objects, so that result does not transfer automatically — but it also is not contradicted.
+- Ridge/asgard goes the other way for its texture: the in-container client creates it with a bare name
+  and the desktop adapter opens it via a `GetAppContainerNamedObjectPath`-resolved root
+  (`SimulatedRealityRemoteSession::EnsureResources`). That direction is proven in production.
+
+So both directions have some evidence. **Decide by measuring the real packaged UWP app against a
+service-created shared texture** (the probe already has this case wired) before committing. If the
+service cannot own the texture, idle "no signal" video needs a rethink, since the surface would only
+exist while an app does.
+
+Whichever direction wins, the negotiated object names should be exchanged over the pipe rather than
+hardcoded — which is what SteamVR does with its "received namespace data" handshake.
+
 
 ### Device registry
 

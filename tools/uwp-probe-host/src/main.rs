@@ -178,9 +178,12 @@ fn main() {
                     4096,
                     PCWSTR(name.as_ptr()),
                 )
-                .expect("CreateFileMapping (default DACL)")
+                .unwrap_or(INVALID_HANDLE_VALUE)
             }
         };
+        if mapping == INVALID_HANDLE_VALUE {
+            println!("[host] shmem  : UNAVAILABLE - continuing; the pipe probe is what matters");
+        }
 
         let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 4096);
         (mapping, view)
