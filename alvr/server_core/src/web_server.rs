@@ -197,11 +197,17 @@ async fn capture_frame(State(ctx): State<Arc<ConnectionContext>>) {
 }
 
 async fn start_recording(State(ctx): State<Arc<ConnectionContext>>) {
-    crate::create_recording_file(&ctx, crate::SESSION_MANAGER.read().settings())
+    // This endpoint is not client-specific, so record every client that is currently streaming.
+    let settings = crate::SESSION_MANAGER.read().settings().clone();
+    for session in ctx.client_sessions() {
+        crate::create_recording_file(&ctx, &session, &settings);
+    }
 }
 
 async fn stop_recording(State(ctx): State<Arc<ConnectionContext>>) {
-    *ctx.video_recording_file.lock() = None;
+    for session in ctx.client_sessions() {
+        session.stop_recording();
+    }
 }
 
 async fn add_firewall_rules() {
@@ -277,7 +283,13 @@ async fn set_buttons(
         })
         .collect();
 
-    ctx.events_sender
-        .send(ServerCoreEvent::Buttons(button_entries))
-        .ok();
+    // This debug endpoint carries no client context, so address the active client.
+    if let Some(client_id) = ctx.active_client_id() {
+        ctx.events_sender
+            .send(ServerCoreEvent::Buttons {
+                client_id,
+                entries: button_entries,
+            })
+            .ok();
+    }
 }

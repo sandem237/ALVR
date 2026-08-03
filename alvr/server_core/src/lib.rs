@@ -35,7 +35,7 @@ use alvr_sockets::StreamSender;
 use bitrate::{BitrateManager, DynamicEncoderParams};
 use statistics::StatisticsManager;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     ffi::OsStr,
     fs::File,
@@ -82,43 +82,163 @@ pub struct ServerNegotiatedStreamingConfig {
     pub enable_hdr: bool,
 }
 
+/// Events emitted by the server core. Variants that originate from a specific headset carry the
+/// `client_id` (the client hostname) so that a backend serving several headsets at once can route
+/// them, instead of assuming there is only ever one connected client.
 pub enum ServerCoreEvent {
     SetOpenvrProperty {
         device_id: u64,
         prop: OpenvrProperty,
     },
-    ClientConnected(ServerNegotiatedStreamingConfig),
-    ClientDisconnected,
-    Battery(BatteryInfo),
-    PlayspaceSync(Vec2),
-    LocalViewParams([ViewParams; 2]), // In relation to head
+    ClientConnected {
+        client_id: String,
+        config: ServerNegotiatedStreamingConfig,
+    },
+    ClientDisconnected {
+        client_id: String,
+    },
+    Battery {
+        client_id: String,
+        info: BatteryInfo,
+    },
+    PlayspaceSync {
+        client_id: String,
+        area: Vec2,
+    },
+    /// In relation to head
+    LocalViewParams {
+        client_id: String,
+        params: [ViewParams; 2],
+    },
     Tracking {
+        client_id: String,
         poll_timestamp: Duration,
     },
-    Buttons(Vec<ButtonEntry>), // Note: this is after mapping
+    /// Note: this is after mapping
+    Buttons {
+        client_id: String,
+        entries: Vec<ButtonEntry>,
+    },
     RequestIDR,
     CaptureFrame,
     GameRenderLatencyFeedback(Duration), // only used for SteamVR
     ShutdownPending,
     RestartPending,
-    ProximityState(bool),
+    ProximityState {
+        client_id: String,
+        is_worn: bool,
+    },
 }
 
-pub struct ConnectionContext {
-    events_sender: mpsc::Sender<ServerCoreEvent>,
+/// Per-client streaming state. One of these exists for each client that is connected or streaming,
+/// so that multiple headsets can be served concurrently without stealing each other's streams.
+///
+/// NB: everything that is scoped to a single streaming session belongs here rather than in
+/// `ConnectionContext`, otherwise a second client would overwrite the first client's sinks and a
+/// single disconnect would tear down every client's streams.
+pub struct ClientSession {
+    pub hostname: String,
     statistics_manager: RwLock<Option<StatisticsManager>>,
     bitrate_manager: Mutex<BitrateManager>,
     tracking_manager: RwLock<TrackingManager>,
     decoder_config: Mutex<Option<DecoderInitializationConfig>>,
-    video_mirror_sender: Mutex<Option<broadcast::Sender<Vec<u8>>>>,
     video_recording_file: Mutex<Option<File>>,
-    connection_threads: Mutex<Vec<JoinHandle<()>>>,
-    clients_to_be_removed: Mutex<HashSet<String>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
+    /// Starts in the corrupted state: the client has not received the initial IDR yet.
+    stream_corrupted: AtomicBool,
+    last_idr_instant: Mutex<Instant>,
 }
 
-pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
+impl ClientSession {
+    pub fn stop_recording(&self) {
+        *self.video_recording_file.lock() = None;
+    }
+
+    fn new(hostname: String, settings: &Settings) -> Self {
+        Self {
+            hostname,
+            statistics_manager: RwLock::new(None),
+            bitrate_manager: Mutex::new(BitrateManager::new(256, 60.0)),
+            tracking_manager: RwLock::new(TrackingManager::new(
+                settings.connection.statistics_history_size,
+            )),
+            decoder_config: Mutex::new(None),
+            video_recording_file: Mutex::new(None),
+            video_channel_sender: Mutex::new(None),
+            haptics_sender: Mutex::new(None),
+            stream_corrupted: AtomicBool::new(true),
+            last_idr_instant: Mutex::new(Instant::now()),
+        }
+    }
+}
+
+pub struct ConnectionContext {
+    events_sender: mpsc::Sender<ServerCoreEvent>,
+    /// Per-client streaming state, keyed by client hostname.
+    clients: RwLock<HashMap<String, Arc<ClientSession>>>,
+    /// The client that the single-HMD (OpenVR) backend is currently bound to. Backends that can
+    /// serve several headsets at once address clients by hostname instead and ignore this.
+    active_client: RwLock<Option<String>>,
+    video_mirror_sender: Mutex<Option<broadcast::Sender<Vec<u8>>>>,
+    connection_threads: Mutex<Vec<JoinHandle<()>>>,
+    clients_to_be_removed: Mutex<HashSet<String>>,
+}
+
+impl ConnectionContext {
+    /// Registers a fresh streaming session for the given client, replacing any stale one.
+    fn create_client_session(&self, hostname: &str, settings: &Settings) -> Arc<ClientSession> {
+        let session = Arc::new(ClientSession::new(hostname.to_owned(), settings));
+        self.clients
+            .write()
+            .insert(hostname.to_owned(), Arc::clone(&session));
+
+        // Bind the single-HMD backend to the first client to arrive.
+        let mut active_client = self.active_client.write();
+        if active_client.is_none() {
+            *active_client = Some(hostname.to_owned());
+        }
+
+        session
+    }
+
+    /// Tears down only the given client's session, leaving other clients streaming.
+    fn remove_client_session(&self, hostname: &str) {
+        self.clients.write().remove(hostname);
+
+        let mut active_client = self.active_client.write();
+        if active_client.as_deref() == Some(hostname) {
+            // Hand the single-HMD backend over to any other client that is still connected.
+            *active_client = self.clients.read().keys().next().cloned();
+        }
+    }
+
+    pub fn client_session(&self, hostname: &str) -> Option<Arc<ClientSession>> {
+        self.clients.read().get(hostname).cloned()
+    }
+
+    /// Every client that currently has a streaming session.
+    pub fn client_sessions(&self) -> Vec<Arc<ClientSession>> {
+        self.clients.read().values().cloned().collect()
+    }
+
+    /// The client the single-HMD backend is bound to, if any.
+    pub fn active_client_id(&self) -> Option<String> {
+        self.active_client.read().clone()
+    }
+
+    /// The session the single-HMD backend is bound to, if any.
+    fn active_session(&self) -> Option<Arc<ClientSession>> {
+        let hostname = self.active_client.read().clone()?;
+        self.client_session(&hostname)
+    }
+}
+
+pub fn create_recording_file(
+    connection_context: &ConnectionContext,
+    session: &ClientSession,
+    settings: &Settings,
+) {
     let codec = settings.video.preferred_codec;
     let ext = match codec {
         CodecType::H264 => "h264",
@@ -126,18 +246,20 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
         CodecType::AV1 => "av1",
     };
 
+    // Include the hostname so concurrent clients cannot collide on the same recording file.
     let path = FILESYSTEM_LAYOUT.get().unwrap().log_dir.join(format!(
-        "recording.{}.{ext}",
-        chrono::Local::now().format("%F.%H-%M-%S")
+        "recording.{}.{}.{ext}",
+        chrono::Local::now().format("%F.%H-%M-%S"),
+        session.hostname,
     ));
 
     match File::create(path) {
         Ok(mut file) => {
-            if let Some(config) = &*connection_context.decoder_config.lock() {
+            if let Some(config) = &*session.decoder_config.lock() {
                 file.write_all(&config.config_buffer).ok();
             }
 
-            *connection_context.video_recording_file.lock() = Some(file);
+            *session.video_recording_file.lock() = Some(file);
 
             connection_context
                 .events_sender
@@ -208,32 +330,13 @@ impl ServerCoreContext {
 
         let (events_sender, events_receiver) = mpsc::channel();
 
-        // Create a temporary StatisticsManager until a headset connects
-        let initial_settings = SESSION_MANAGER.read().settings().clone();
-        let stats = StatisticsManager::new(
-            initial_settings.connection.statistics_history_size,
-            Duration::from_secs_f32(1.0 / 90.0),
-            if let Switch::Enabled(config) = &initial_settings.headset.controllers {
-                config.steamvr_pipeline_frames
-            } else {
-                0.0
-            },
-        );
-
         let connection_context = Arc::new(ConnectionContext {
             events_sender,
-            statistics_manager: RwLock::new(Some(stats)),
-            bitrate_manager: Mutex::new(BitrateManager::new(256, 60.0)),
-            tracking_manager: RwLock::new(TrackingManager::new(
-                initial_settings.connection.statistics_history_size,
-            )),
-            decoder_config: Mutex::new(None),
+            clients: RwLock::new(HashMap::new()),
+            active_client: RwLock::new(None),
             video_mirror_sender: Mutex::new(None),
-            video_recording_file: Mutex::new(None),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
-            video_channel_sender: Mutex::new(None),
-            haptics_sender: Mutex::new(None),
         });
 
         let webserver_runtime = Runtime::new().unwrap();
@@ -274,6 +377,7 @@ impl ServerCoreContext {
         dbg_server_core!("get_device_motion: dev={device_id} sample_ts={sample_timestamp:?}");
 
         self.connection_context
+            .active_session()?
             .tracking_manager
             .read()
             .get_device_motion(device_id, sample_timestamp)
@@ -287,6 +391,7 @@ impl ServerCoreContext {
         dbg_server_core!("get_hand_skeleton: hand={hand_type:?} ts={timestamp:?}");
 
         self.connection_context
+            .active_session()?
             .tracking_manager
             .read()
             .get_hand_skeleton(hand_type, timestamp)
@@ -298,10 +403,14 @@ impl ServerCoreContext {
 
         let latency = self
             .connection_context
-            .statistics_manager
-            .read()
-            .as_ref()
-            .map(|stats| stats.motion_to_photon_latency_average())
+            .active_session()
+            .and_then(|session| {
+                session
+                    .statistics_manager
+                    .read()
+                    .as_ref()
+                    .map(|stats| stats.motion_to_photon_latency_average())
+            })
             .unwrap_or_default();
 
         let max_prediction =
@@ -320,10 +429,14 @@ impl ServerCoreContext {
         dbg_server_core!("get_tracker_pose_time_offset");
 
         self.connection_context
-            .statistics_manager
-            .read()
-            .as_ref()
-            .map(|stats| stats.tracker_pose_time_offset())
+            .active_session()
+            .and_then(|session| {
+                session
+                    .statistics_manager
+                    .read()
+                    .as_ref()
+                    .map(|stats| stats.tracker_pose_time_offset())
+            })
             .unwrap_or_default()
     }
 
@@ -353,10 +466,11 @@ impl ServerCoreContext {
                 .and_then(|c| c.haptics.as_option().cloned())
         };
 
-        if let (Some(config), Some(sender)) = (
-            haptics_config,
-            &mut *self.connection_context.haptics_sender.lock(),
-        ) {
+        let Some(session) = self.connection_context.active_session() else {
+            return;
+        };
+
+        if let (Some(config), Some(sender)) = (haptics_config, &mut *session.haptics_sender.lock()) {
             sender
                 .send_header(&haptics::map_haptics(&config, haptics))
                 .ok();
@@ -370,11 +484,15 @@ impl ServerCoreContext {
             sender.send(config_buffer.clone()).ok();
         }
 
-        if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
+        let Some(session) = self.connection_context.active_session() else {
+            return;
+        };
+
+        if let Some(file) = &mut *session.video_recording_file.lock() {
             file.write_all(&config_buffer).ok();
         }
 
-        *self.connection_context.decoder_config.lock() = Some(DecoderInitializationConfig {
+        *session.decoder_config.lock() = Some(DecoderInitializationConfig {
             codec,
             config_buffer,
             ext_str: String::new(),
@@ -390,16 +508,15 @@ impl ServerCoreContext {
     ) {
         dbg_server_core!("send_video_nal");
 
-        // start in the corrupts state, the client didn't receive the initial IDR yet.
-        static STREAM_CORRUPTED: AtomicBool = AtomicBool::new(true);
-        static LAST_IDR_INSTANT: LazyLock<Mutex<Instant>> =
-            LazyLock::new(|| Mutex::new(Instant::now()));
+        let Some(session) = self.connection_context.active_session() else {
+            return;
+        };
 
-        if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
+        if let Some(sender) = &*session.video_channel_sender.lock() {
             let buffer_size = nal_buffer.len();
 
             if is_idr {
-                STREAM_CORRUPTED.store(false, Ordering::SeqCst);
+                session.stream_corrupted.store(false, Ordering::SeqCst);
             }
 
             if let Switch::Enabled(config) = &SESSION_MANAGER
@@ -409,7 +526,7 @@ impl ServerCoreContext {
                 .capture
                 .rolling_video_files
                 && Instant::now()
-                    > *LAST_IDR_INSTANT.lock() + Duration::from_secs(config.duration_s)
+                    > *session.last_idr_instant.lock() + Duration::from_secs(config.duration_s)
             {
                 self.connection_context
                     .events_sender
@@ -419,13 +536,14 @@ impl ServerCoreContext {
                 if is_idr {
                     create_recording_file(
                         &self.connection_context,
+                        &session,
                         SESSION_MANAGER.read().settings(),
                     );
-                    *LAST_IDR_INSTANT.lock() = Instant::now();
+                    *session.last_idr_instant.lock() = Instant::now();
                 }
             }
 
-            if !STREAM_CORRUPTED.load(Ordering::SeqCst)
+            if !session.stream_corrupted.load(Ordering::SeqCst)
                 || !SESSION_MANAGER
                     .read()
                     .settings()
@@ -436,7 +554,7 @@ impl ServerCoreContext {
                     sender.send(nal_buffer.clone()).ok();
                 }
 
-                if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
+                if let Some(file) = &mut *session.video_recording_file.lock() {
                     file.write_all(&nal_buffer).ok();
                 }
 
@@ -449,7 +567,7 @@ impl ServerCoreContext {
                     payload: nal_buffer,
                 });
                 if matches!(sender_result, Err(TrySendError::Full(_))) {
-                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
+                    session.stream_corrupted.store(true, Ordering::SeqCst);
                     self.connection_context
                         .events_sender
                         .send(ServerCoreEvent::RequestIDR)
@@ -460,10 +578,10 @@ impl ServerCoreContext {
                 warn!("Dropping video packet. Reason: Waiting for IDR frame");
             }
 
-            if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
+            if let Some(stats) = &mut *session.statistics_manager.write() {
                 let encoder_latency = stats.report_frame_encoded(timestamp, buffer_size);
 
-                self.connection_context
+                session
                     .bitrate_manager
                     .lock()
                     .report_frame_encoded(timestamp, encoder_latency, buffer_size);
@@ -474,16 +592,18 @@ impl ServerCoreContext {
     pub fn get_dynamic_encoder_params(&self) -> Option<DynamicEncoderParams> {
         dbg_server_core!("get_dynamic_encoder_params");
 
+        let session = self.connection_context.active_session()?;
+
         let pair = {
             let session_manager_lock = SESSION_MANAGER.read();
-            self.connection_context
+            session
                 .bitrate_manager
                 .lock()
                 .get_encoder_params(&session_manager_lock.settings().video.bitrate)
         };
 
         pair.map(|(params, stats)| {
-            if let Some(stats_manager) = &mut *self.connection_context.statistics_manager.write() {
+            if let Some(stats_manager) = &mut *session.statistics_manager.write() {
                 stats_manager.report_throughput_stats(stats);
             }
             params
@@ -493,7 +613,9 @@ impl ServerCoreContext {
     pub fn report_composed(&self, target_timestamp: Duration, offset: Duration) {
         dbg_server_core!("report_composed");
 
-        if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
+        if let Some(session) = self.connection_context.active_session()
+            && let Some(stats) = &mut *session.statistics_manager.write()
+        {
             stats.report_frame_composed(target_timestamp, offset);
         }
     }
@@ -501,27 +623,29 @@ impl ServerCoreContext {
     pub fn report_present(&self, target_timestamp: Duration, offset: Duration) {
         dbg_server_core!("report_present");
 
-        if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
+        let Some(session) = self.connection_context.active_session() else {
+            return;
+        };
+
+        if let Some(stats) = &mut *session.statistics_manager.write() {
             stats.report_frame_present(target_timestamp, offset);
         }
 
         let session_manager_lock = SESSION_MANAGER.read();
-        self.connection_context
-            .bitrate_manager
-            .lock()
-            .report_frame_present(
-                &session_manager_lock
-                    .settings()
-                    .video
-                    .bitrate
-                    .adapt_to_framerate,
-            );
+        session.bitrate_manager.lock().report_frame_present(
+            &session_manager_lock
+                .settings()
+                .video
+                .bitrate
+                .adapt_to_framerate,
+        );
     }
 
     pub fn duration_until_next_vsync(&self) -> Option<Duration> {
         dbg_server_core!("duration_until_next_vsync");
 
         self.connection_context
+            .active_session()?
             .statistics_manager
             .write()
             .as_mut()

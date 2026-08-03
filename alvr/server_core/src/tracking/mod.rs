@@ -7,7 +7,7 @@ pub use face::*;
 pub use vmc::*;
 
 use crate::{
-    ConnectionContext, SESSION_MANAGER, ServerCoreEvent,
+    ClientSession, ConnectionContext, SESSION_MANAGER, ServerCoreEvent,
     connection::STREAMING_RECV_TIMEOUT,
     hand_gestures::{self, HAND_GESTURE_BUTTON_SET, HandGestureManager},
     input_mapping::ButtonMappingManager,
@@ -263,6 +263,7 @@ impl TrackingManager {
 
 pub fn tracking_loop(
     ctx: &ConnectionContext,
+    session: &ClientSession,
     initial_settings: Settings,
     mut tracking_receiver: StreamReceiver<TrackingData>,
     is_streaming: impl Fn() -> bool,
@@ -316,7 +317,7 @@ pub fn tracking_loop(
 
         let timestamp = tracking.poll_timestamp;
 
-        if let Some(stats) = &mut *ctx.statistics_manager.write() {
+        if let Some(stats) = &mut *session.statistics_manager.write() {
             stats.report_tracking_received(timestamp);
         }
 
@@ -332,7 +333,7 @@ pub fn tracking_loop(
 
         let device_motion_keys;
         {
-            let mut tracking_manager_lock = ctx.tracking_manager.write();
+            let mut tracking_manager_lock = session.tracking_manager.write();
             let session_manager_lock = SESSION_MANAGER.read();
             let headset_config = &session_manager_lock.settings().headset;
 
@@ -411,8 +412,9 @@ pub fn tracking_loop(
                 && let Some(hand_skeleton) = tracking.hand_skeletons[0]
             {
                 ctx.events_sender
-                    .send(ServerCoreEvent::Buttons(
-                        hand_gestures::trigger_hand_gesture_actions(
+                    .send(ServerCoreEvent::Buttons {
+                        client_id: session.hostname.clone(),
+                        entries: hand_gestures::trigger_hand_gesture_actions(
                             gestures_button_mapping_manager,
                             *inp::HAND_LEFT_ID,
                             &hand_gesture_manager.get_active_gestures(
@@ -422,15 +424,16 @@ pub fn tracking_loop(
                             ),
                             gestures_config.only_touch,
                         ),
-                    ))
+                    })
                     .ok();
             }
             if !device_motion_keys.contains(&*inp::HAND_RIGHT_ID)
                 && let Some(hand_skeleton) = tracking.hand_skeletons[1]
             {
                 ctx.events_sender
-                    .send(ServerCoreEvent::Buttons(
-                        hand_gestures::trigger_hand_gesture_actions(
+                    .send(ServerCoreEvent::Buttons {
+                        client_id: session.hostname.clone(),
+                        entries: hand_gestures::trigger_hand_gesture_actions(
                             gestures_button_mapping_manager,
                             *inp::HAND_RIGHT_ID,
                             &hand_gesture_manager.get_active_gestures(
@@ -440,13 +443,14 @@ pub fn tracking_loop(
                             ),
                             gestures_config.only_touch,
                         ),
-                    ))
+                    })
                     .ok();
             }
         }
 
         ctx.events_sender
             .send(ServerCoreEvent::Tracking {
+                client_id: session.hostname.clone(),
                 poll_timestamp: tracking.poll_timestamp,
             })
             .ok();
@@ -465,7 +469,7 @@ pub fn tracking_loop(
             );
 
             if let Some(sink) = &mut vmc_sink {
-                let tracking_manager_lock = ctx.tracking_manager.read();
+                let tracking_manager_lock = session.tracking_manager.read();
                 let device_motions = device_motion_keys
                     .iter()
                     .map(move |id| {
@@ -493,7 +497,7 @@ pub fn tracking_loop(
             Switch::Enabled(BodyTrackingConfig { tracked: true, .. })
         );
         if track_body && let Some(sink) = &mut body_tracking_sink {
-            let tracking_manager_lock = ctx.tracking_manager.read();
+            let tracking_manager_lock = session.tracking_manager.read();
             let device_motions = device_motion_keys
                 .iter()
                 .map(move |id| {

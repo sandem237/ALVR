@@ -832,7 +832,11 @@ fn connection_pipeline(
 
     let disconnect_notif = Arc::new(Condvar::new());
 
-    *ctx.statistics_manager.write() = Some(StatisticsManager::new(
+    // Create this client's own streaming state, so that concurrent clients cannot overwrite each
+    // other's sinks and a disconnect only tears down the client it belongs to.
+    let session = ctx.create_client_session(&client_hostname, &initial_settings);
+
+    *session.statistics_manager.write() = Some(StatisticsManager::new(
         initial_settings.connection.statistics_history_size,
         Duration::from_secs_f32(1.0 / fps),
         if let Switch::Enabled(config) = &initial_settings.headset.controllers {
@@ -841,9 +845,9 @@ fn connection_pipeline(
             0.0
         },
     ));
-    *ctx.bitrate_manager.lock() =
+    *session.bitrate_manager.lock() =
         BitrateManager::new(initial_settings.video.bitrate.history_size, fps);
-    *ctx.tracking_manager.write() =
+    *session.tracking_manager.write() =
         TrackingManager::new(initial_settings.connection.statistics_history_size);
 
     let control_sender = Arc::new(Mutex::new(socket.request_reliable_stream()?));
@@ -861,11 +865,11 @@ fn connection_pipeline(
 
     let (video_channel_sender, video_channel_receiver) =
         std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
-    *ctx.video_channel_sender.lock() = Some(video_channel_sender);
-    *ctx.haptics_sender.lock() = Some(haptics_sender);
+    *session.video_channel_sender.lock() = Some(video_channel_sender);
+    *session.haptics_sender.lock() = Some(haptics_sender);
 
     let video_send_thread = thread::spawn({
-        let ctx = Arc::clone(&ctx);
+        let session = Arc::clone(&session);
         let client_hostname = client_hostname.clone();
         move || {
             while is_streaming(&client_hostname) {
@@ -878,7 +882,8 @@ fn connection_pipeline(
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
 
-                ctx.tracking_manager
+                session
+                    .tracking_manager
                     .read()
                     .unrecenter_view_params(&mut header.global_view_params);
 
@@ -1045,10 +1050,11 @@ fn connection_pipeline(
 
     let tracking_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
+        let session = Arc::clone(&session);
         let initial_settings = initial_settings.clone();
         let client_hostname = client_hostname.clone();
         move || {
-            tracking::tracking_loop(&ctx, initial_settings, tracking_receiver, || {
+            tracking::tracking_loop(&ctx, &session, initial_settings, tracking_receiver, || {
                 is_streaming(&client_hostname)
             });
         }
@@ -1056,6 +1062,7 @@ fn connection_pipeline(
 
     let statistics_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
+        let session = Arc::clone(&session);
         let client_hostname = client_hostname.clone();
         move || {
             while is_streaming(&client_hostname) {
@@ -1068,7 +1075,7 @@ fn connection_pipeline(
                     return;
                 };
 
-                if let Some(stats) = &mut *ctx.statistics_manager.write() {
+                if let Some(stats) = &mut *session.statistics_manager.write() {
                     let timestamp = client_stats.target_timestamp;
                     let decoder_latency = client_stats.video_decode;
                     let (network_latency, game_latency) = stats.report_statistics(client_stats);
@@ -1078,7 +1085,7 @@ fn connection_pipeline(
                         .ok();
 
                     let session_manager_lock = SESSION_MANAGER.read();
-                    ctx.bitrate_manager.lock().report_frame_latencies(
+                    session.bitrate_manager.lock().report_frame_latencies(
                         &session_manager_lock.settings().video.bitrate.mode,
                         timestamp,
                         network_latency,
@@ -1163,6 +1170,7 @@ fn connection_pipeline(
 
         let disconnect_notif = Arc::clone(&disconnect_notif);
         let control_sender = Arc::clone(&control_sender);
+        let session = Arc::clone(&session);
         let client_hostname = client_hostname.clone();
         move || {
             let mut disconnection_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
@@ -1188,7 +1196,8 @@ fn connection_pipeline(
                         if !initial_settings.headset.tracking_ref_only {
                             let session_manager_lock = SESSION_MANAGER.read();
                             let config = &session_manager_lock.settings().headset;
-                            ctx.tracking_manager
+                            session
+                                .tracking_manager
                                 .write()
                                 .recenter(&config.recentering_mode);
 
@@ -1197,18 +1206,24 @@ fn connection_pipeline(
                             if wh.is_finite() && wh > 0.0 {
                                 info!("Received new playspace with size: {}", area);
                                 ctx.events_sender
-                                    .send(ServerCoreEvent::PlayspaceSync(area))
+                                    .send(ServerCoreEvent::PlayspaceSync {
+                                        client_id: client_hostname.clone(),
+                                        area,
+                                    })
                                     .ok();
                             } else {
                                 warn!("Received invalid playspace size: {}", area);
                                 ctx.events_sender
-                                    .send(ServerCoreEvent::PlayspaceSync(Vec2::new(2.0, 2.0)))
+                                    .send(ServerCoreEvent::PlayspaceSync {
+                                        client_id: client_hostname.clone(),
+                                        area: Vec2::new(2.0, 2.0),
+                                    })
                                     .ok();
                             }
                         }
                     }
                     ClientControlPacket::RequestIdr => {
-                        if let Some(config) = ctx.decoder_config.lock().clone() {
+                        if let Some(config) = session.decoder_config.lock().clone() {
                             control_sender
                                 .lock()
                                 .send(&ServerControlPacket::DecoderConfig(config))
@@ -1218,15 +1233,21 @@ fn connection_pipeline(
                     }
                     ClientControlPacket::LocalViewParams(params) => {
                         ctx.events_sender
-                            .send(ServerCoreEvent::LocalViewParams(params))
+                            .send(ServerCoreEvent::LocalViewParams {
+                                client_id: client_hostname.clone(),
+                                params,
+                            })
                             .ok();
                     }
                     ClientControlPacket::Battery(packet) => {
                         ctx.events_sender
-                            .send(ServerCoreEvent::Battery(packet.clone()))
+                            .send(ServerCoreEvent::Battery {
+                                client_id: client_hostname.clone(),
+                                info: packet.clone(),
+                            })
                             .ok();
 
-                        if let Some(stats) = &mut *ctx.statistics_manager.write() {
+                        if let Some(stats) = &mut *session.statistics_manager.write() {
                             stats.report_battery(
                                 packet.device_id,
                                 packet.gauge_value,
@@ -1266,7 +1287,10 @@ fn connection_pipeline(
 
                             if !button_entries.is_empty() {
                                 ctx.events_sender
-                                    .send(ServerCoreEvent::Buttons(button_entries))
+                                    .send(ServerCoreEvent::Buttons {
+                                        client_id: client_hostname.clone(),
+                                        entries: button_entries,
+                                    })
                                     .ok();
                             }
                         };
@@ -1296,7 +1320,10 @@ fn connection_pipeline(
                     ClientControlPacket::KeepAlive | ClientControlPacket::StreamReady => (),
                     ClientControlPacket::ProximityState(headset_is_worn) => {
                         ctx.events_sender
-                            .send(ServerCoreEvent::ProximityState(headset_is_worn))
+                            .send(ServerCoreEvent::ProximityState {
+                                client_id: client_hostname.clone(),
+                                is_worn: headset_is_worn,
+                            })
                             .ok();
                     }
                     ClientControlPacket::Reserved(_) | ClientControlPacket::ReservedBuffer(_) => (),
@@ -1362,7 +1389,7 @@ fn connection_pipeline(
     }
     if initial_settings.extra.capture.startup_video_recording {
         info!("Creating recording file");
-        crate::create_recording_file(&ctx, session_manager_lock.settings());
+        crate::create_recording_file(&ctx, &session, session_manager_lock.settings());
     }
 
     session_manager_lock.update_client_connections(
@@ -1371,8 +1398,9 @@ fn connection_pipeline(
     );
 
     ctx.events_sender
-        .send(ServerCoreEvent::ClientConnected(
-            ServerNegotiatedStreamingConfig {
+        .send(ServerCoreEvent::ClientConnected {
+            client_id: client_hostname.clone(),
+            config: ServerNegotiatedStreamingConfig {
                 transcoding_view_resolution,
                 emulated_headset_view_resolution: transcoding_view_resolution,
                 refresh_rate: fps as _,
@@ -1383,21 +1411,22 @@ fn connection_pipeline(
                 encoding_gamma,
                 enable_hdr,
             },
-        ))
+        })
         .ok();
 
     dbg_connection!("connection_pipeline: Threads initialized; unlocking streams");
     alvr_common::wait_rwlock(&disconnect_notif, &mut session_manager_lock);
     dbg_connection!("connection_pipeline: Begin connection shutdown");
 
-    // This requests shutdown from threads
-    *ctx.video_channel_sender.lock() = None;
-    *ctx.haptics_sender.lock() = None;
+    // This requests shutdown from threads. Scoped to this client's own session, so that other
+    // clients that are still streaming keep their video and haptics channels.
+    *session.video_channel_sender.lock() = None;
+    *session.haptics_sender.lock() = None;
 
-    *ctx.video_recording_file.lock() = None;
+    *session.video_recording_file.lock() = None;
 
     session_manager_lock.update_client_connections(
-        client_hostname,
+        client_hostname.clone(),
         ClientConnectionsAction::SetConnectionState(ConnectionState::Disconnecting),
     );
 
@@ -1438,8 +1467,14 @@ fn connection_pipeline(
     keepalive_thread.join().ok();
     lifecycle_check_thread.join().ok();
 
+    // All threads holding this session are done, so it can be dropped without affecting the other
+    // clients. This also hands the single-HMD backend over to another client if one is streaming.
+    ctx.remove_client_session(&client_hostname);
+
     ctx.events_sender
-        .send(ServerCoreEvent::ClientDisconnected)
+        .send(ServerCoreEvent::ClientDisconnected {
+            client_id: client_hostname,
+        })
         .ok();
 
     dbg_connection!("connection_pipeline: End");

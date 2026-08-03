@@ -278,35 +278,37 @@ pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent, timeout_ns: 
         && let Ok(event) = receiver.recv_timeout(Duration::from_nanos(timeout_ns))
     {
         match event {
-            ServerCoreEvent::ClientConnected(config) => unsafe {
+            // Note: this C ABI is single-client by design, so the client id is not surfaced here.
+            // Backends that serve several headsets at once use the Rust API instead.
+            ServerCoreEvent::ClientConnected { config, .. } => unsafe {
                 *NEGOTIATED_CONFIG.lock() = Some(config);
                 *out_event = AlvrEvent::ClientConnected;
             },
-            ServerCoreEvent::ClientDisconnected => unsafe {
+            ServerCoreEvent::ClientDisconnected { .. } => unsafe {
                 *out_event = AlvrEvent::ClientDisconnected;
             },
-            ServerCoreEvent::Battery(battery) => unsafe {
+            ServerCoreEvent::Battery { info, .. } => unsafe {
                 *out_event = AlvrEvent::Battery(AlvrBatteryInfo {
-                    device_id: battery.device_id,
-                    gauge_value: battery.gauge_value,
-                    is_plugged: battery.is_plugged,
+                    device_id: info.device_id,
+                    gauge_value: info.gauge_value,
+                    is_plugged: info.is_plugged,
                 });
             },
-            ServerCoreEvent::PlayspaceSync(bounds) => unsafe {
-                *out_event = AlvrEvent::PlayspaceSync(bounds.to_array())
+            ServerCoreEvent::PlayspaceSync { area, .. } => unsafe {
+                *out_event = AlvrEvent::PlayspaceSync(area.to_array())
             },
-            ServerCoreEvent::LocalViewParams(config) => unsafe {
+            ServerCoreEvent::LocalViewParams { params, .. } => unsafe {
                 *out_event = AlvrEvent::LocalViewParams([
-                    alvr_common::to_capi_view_params(&config[0]),
-                    alvr_common::to_capi_view_params(&config[1]),
+                    alvr_common::to_capi_view_params(&params[0]),
+                    alvr_common::to_capi_view_params(&params[1]),
                 ])
             },
-            ServerCoreEvent::Tracking { poll_timestamp } => unsafe {
+            ServerCoreEvent::Tracking { poll_timestamp, .. } => unsafe {
                 *out_event = AlvrEvent::TrackingUpdated {
                     sample_timestamp_ns: poll_timestamp.as_nanos() as u64,
                 };
             },
-            ServerCoreEvent::Buttons(entries) => {
+            ServerCoreEvent::Buttons { entries, .. } => {
                 BUTTONS_QUEUE.lock().push_back(entries);
                 unsafe { *out_event = AlvrEvent::ButtonsUpdated };
             }
@@ -320,8 +322,8 @@ pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent, timeout_ns: 
             },
             ServerCoreEvent::GameRenderLatencyFeedback(_)
             | ServerCoreEvent::SetOpenvrProperty { .. } => {} // implementation not needed
-            ServerCoreEvent::ProximityState(headset_is_worn) => unsafe {
-                *out_event = AlvrEvent::ProximityState(headset_is_worn);
+            ServerCoreEvent::ProximityState { is_worn, .. } => unsafe {
+                *out_event = AlvrEvent::ProximityState(is_worn);
             },
         }
 

@@ -16,7 +16,7 @@ use bindings::*;
 
 use alvr_common::{
     BUTTON_INFO, HAND_LEFT_ID, HAND_RIGHT_ID, HAND_TRACKER_LEFT_ID, HAND_TRACKER_RIGHT_ID, HEAD_ID,
-    Pose, ViewParams, error,
+    Pose, ViewParams, error, info,
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
     warn,
@@ -246,11 +246,35 @@ fn make_settings(negotiated: Option<&ServerNegotiatedStreamingConfig>) -> Settin
     }
 }
 
+/// The client an event belongs to, or `None` for events that are not client-specific.
+fn event_client_id(event: &ServerCoreEvent) -> Option<&str> {
+    match event {
+        ServerCoreEvent::ClientConnected { client_id, .. }
+        | ServerCoreEvent::ClientDisconnected { client_id }
+        | ServerCoreEvent::Battery { client_id, .. }
+        | ServerCoreEvent::PlayspaceSync { client_id, .. }
+        | ServerCoreEvent::LocalViewParams { client_id, .. }
+        | ServerCoreEvent::Tracking { client_id, .. }
+        | ServerCoreEvent::Buttons { client_id, .. }
+        | ServerCoreEvent::ProximityState { client_id, .. } => Some(client_id),
+        ServerCoreEvent::SetOpenvrProperty { .. }
+        | ServerCoreEvent::RequestIDR
+        | ServerCoreEvent::CaptureFrame
+        | ServerCoreEvent::GameRenderLatencyFeedback(_)
+        | ServerCoreEvent::ShutdownPending
+        | ServerCoreEvent::RestartPending => None,
+    }
+}
+
 fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
     let handle = thread::spawn(move || {
         if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
             context.start_connection();
         }
+
+        // SteamVR exposes exactly one HMD per vrserver, so this backend binds to the first client
+        // that connects and ignores events from any other client until it disconnects.
+        let mut bound_client: Option<String> = None;
 
         let mut last_resync = Instant::now();
         loop {
@@ -260,11 +284,21 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
 
+            // Drop events belonging to clients this backend is not driving.
+            if let Some(client_id) = event_client_id(&event)
+                && bound_client.as_deref().is_some_and(|bound| bound != client_id)
+            {
+                continue;
+            }
+
             match event {
                 ServerCoreEvent::SetOpenvrProperty { device_id, prop } => {
                     props::set_openvr_prop(None, device_id, prop)
                 }
-                ServerCoreEvent::ClientConnected(config) => unsafe {
+                ServerCoreEvent::ClientConnected { client_id, config } => unsafe {
+                    info!("Binding SteamVR HMD to client {client_id}");
+                    bound_client = Some(client_id);
+
                     if InitializeStreaming(make_settings(Some(&config))) {
                         RequestDriverResync();
                     } else {
@@ -274,14 +308,19 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     }
                 },
 
-                ServerCoreEvent::ClientDisconnected => unsafe { DeinitializeStreaming() },
-                ServerCoreEvent::Battery(info) => unsafe {
+                ServerCoreEvent::ClientDisconnected { .. } => unsafe {
+                    // Release the HMD so another client can take it over.
+                    bound_client = None;
+
+                    DeinitializeStreaming()
+                },
+                ServerCoreEvent::Battery { info, .. } => unsafe {
                     SetBattery(info.device_id, info.gauge_value, info.is_plugged)
                 },
-                ServerCoreEvent::PlayspaceSync(bounds) => unsafe {
-                    SetChaperoneArea(bounds.x, bounds.y)
+                ServerCoreEvent::PlayspaceSync { area, .. } => unsafe {
+                    SetChaperoneArea(area.x, area.y)
                 },
-                ServerCoreEvent::LocalViewParams(params) => unsafe {
+                ServerCoreEvent::LocalViewParams { params, .. } => unsafe {
                     *LOCAL_VIEW_PARAMS.write() = params;
 
                     let ffi_params = [
@@ -290,7 +329,7 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     ];
                     SetLocalViewParams(ffi_params.as_ptr());
                 },
-                ServerCoreEvent::Tracking { poll_timestamp } => {
+                ServerCoreEvent::Tracking { poll_timestamp, .. } => {
                     let headset_config = &alvr_server_core::settings().headset;
 
                     let controllers_config = headset_config.controllers.clone().into_option();
@@ -461,7 +500,7 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                         };
                     }
                 }
-                ServerCoreEvent::Buttons(entries) => {
+                ServerCoreEvent::Buttons { entries, .. } => {
                     for entry in entries {
                         let value = match entry.value {
                             ButtonValue::Binary(value) => FfiButtonValue {
@@ -500,8 +539,8 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     // todo: send different HUD message for shutdown or restart
                     unsafe { ShutdownSteamvr() };
                 }
-                ServerCoreEvent::ProximityState(headset_is_worn) => unsafe {
-                    SetProximityState(headset_is_worn)
+                ServerCoreEvent::ProximityState { is_worn, .. } => unsafe {
+                    SetProximityState(is_worn)
                 },
             }
         }
