@@ -179,7 +179,14 @@ impl<R: DeserializeOwned> ControlSocketReceiver<R> {
 }
 
 pub fn get_server_listener(timeout: Duration) -> Result<TcpListener> {
-    let listener = bind(timeout, CONTROL_PORT, None, SocketBufferConfig::default())?;
+    get_server_listener_on_port(timeout, CONTROL_PORT)
+}
+
+/// Listens on an explicit control port instead of the well-known [`CONTROL_PORT`]. Real clients
+/// each have their own IP so they can all use the default, but several emulated clients on one
+/// machine would collide on it, so test tooling can pick a distinct port per instance.
+pub fn get_server_listener_on_port(timeout: Duration, port: u16) -> Result<TcpListener> {
+    let listener = bind(timeout, port, None, SocketBufferConfig::default())?;
 
     Ok(listener)
 }
@@ -191,15 +198,16 @@ pub struct ProtoControlSocket {
 }
 
 pub enum PeerType<'a> {
-    AnyClient(Vec<IpAddr>),
+    /// The candidate client IPs, and the control port to dial them on.
+    AnyClient(Vec<IpAddr>, u16),
     Server(&'a TcpListener),
 }
 
 impl ProtoControlSocket {
     pub fn connect_to(timeout: Duration, peer: PeerType<'_>) -> ConResult<(Self, IpAddr)> {
         let socket = match peer {
-            PeerType::AnyClient(ips) => {
-                connect_to_client(timeout, &ips, CONTROL_PORT, SocketBufferConfig::default())?.0
+            PeerType::AnyClient(ips, control_port) => {
+                connect_to_client(timeout, &ips, control_port, SocketBufferConfig::default())?.0
             }
             PeerType::Server(listener) => accept_from_server(listener, None, timeout)?.0,
         };

@@ -355,6 +355,7 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
                 Arc::clone(&ctx),
                 Arc::clone(&lifecycle_state),
                 wired_client_ips,
+                CONTROL_PORT,
             )
             .is_ok()
         {
@@ -388,6 +389,7 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
                 Arc::clone(&ctx),
                 Arc::clone(&lifecycle_state),
                 available_manual_client_ips,
+                CONTROL_PORT,
             )
             .is_ok()
         {
@@ -419,7 +421,7 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
                 continue;
             }
 
-            for (client_hostname, client_ip) in clients {
+            for (client_hostname, (client_ip, client_control_port)) in clients {
                 let trusted = {
                     let mut session_manager = SESSION_MANAGER.write();
 
@@ -455,6 +457,7 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
                         Arc::clone(&ctx),
                         Arc::clone(&lifecycle_state),
                         [(client_ip, client_hostname.clone())].into_iter().collect(),
+                        client_control_port,
                     )
                 {
                     error!("Could not initiate connection for {client_hostname}: {e}");
@@ -481,12 +484,14 @@ fn try_connect(
     ctx: Arc<ConnectionContext>,
     lifecycle_state: Arc<RwLock<LifecycleState>>,
     mut client_ips: HashMap<IpAddr, String>,
+    control_port: u16,
 ) -> ConResult {
     dbg_connection!("try_connect: Finding client and creating control socket");
 
     let (socket, client_ip, connection_result) = alvr_sockets::connect_to_client(
         client_ips.keys().cloned().collect(),
         Duration::from_secs(1),
+        control_port,
     )?;
 
     let Some(client_hostname) = client_ips.remove(&client_ip) else {

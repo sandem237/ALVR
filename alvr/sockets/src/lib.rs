@@ -24,6 +24,9 @@ pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MDNS_SERVICE_TYPE: &str = "_alvr._tcp.local.";
 pub const MDNS_PROTOCOL_KEY: &str = "protocol";
 pub const MDNS_DEVICE_ID_KEY: &str = "device_id";
+/// Optional: the control port the client listens on, when it is not [`CONTROL_PORT`]. Lets several
+/// emulated clients share one machine, which real clients never need since each has its own IP.
+pub const MDNS_CONTROL_PORT_KEY: &str = "control_port";
 
 pub const WIRED_CLIENT_HOSTNAME: &str = "client.wired";
 
@@ -99,9 +102,10 @@ fn set_dscp(socket: &Socket, dscp: Option<DscpTos>) {
 pub fn connect_to_client<T: DeserializeOwned>(
     client_ips: Vec<IpAddr>,
     timeout: Duration,
+    control_port: u16,
 ) -> ConResult<(ProtoControlSocket, IpAddr, T)> {
     let (mut control_socket, client_ip) =
-        ProtoControlSocket::connect_to(timeout, PeerType::AnyClient(client_ips))?;
+        ProtoControlSocket::connect_to(timeout, PeerType::AnyClient(client_ips, control_port))?;
 
     let res = control_socket.recv(timeout)?;
 

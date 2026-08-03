@@ -379,6 +379,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "alvr_mock_device"
+version = "21.0.0-dev12"
+dependencies = [
+ "alvr_client_core",
+ "alvr_common",
+ "alvr_packets",
+ "alvr_session",
+ "alvr_sockets",
+ "alvr_system_info",
+ "env_logger",
+ "rand 0.10.1",
+]
+
+[[package]]
 name = "alvr_packets"
 version = "21.0.0-dev12"
 dependencies = [

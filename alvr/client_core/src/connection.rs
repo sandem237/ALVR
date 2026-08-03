@@ -25,6 +25,7 @@ use alvr_sockets::{
 };
 use std::{
     collections::VecDeque,
+    env,
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
@@ -130,9 +131,18 @@ fn connection_pipeline(
 
     let (mut proto_control_socket, server_ip) = {
         let config = Config::load();
-        let announcer_socket = AnnouncerSocket::new(&config.hostname).to_con()?;
+        // Test tooling can move this off the well-known port so several emulated clients can run on
+        // one machine. Real clients leave it unset and use CONTROL_PORT.
+        let control_port = env::var("ALVR_CLIENT_CONTROL_PORT")
+            .ok()
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(alvr_sockets::CONTROL_PORT);
+
+        let announcer_socket =
+            AnnouncerSocket::new_with_control_port(&config.hostname, control_port).to_con()?;
         let listener_socket =
-            alvr_sockets::get_server_listener(HANDSHAKE_ACTION_TIMEOUT).to_con()?;
+            alvr_sockets::get_server_listener_on_port(HANDSHAKE_ACTION_TIMEOUT, control_port)
+                .to_con()?;
 
         loop {
             if *lifecycle_state.write() != LifecycleState::Resumed {

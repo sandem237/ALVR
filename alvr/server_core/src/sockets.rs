@@ -18,8 +18,8 @@ impl WelcomeSocket {
         Ok(Self { mdns_receiver })
     }
 
-    // Returns: client IP, client hostname
-    pub fn recv_all(&self) -> Result<HashMap<String, IpAddr>> {
+    /// Returns the discovered clients by hostname, with the address and control port to dial.
+    pub fn recv_all(&self) -> Result<HashMap<String, (IpAddr, u16)>> {
         let mut clients = HashMap::new();
 
         loop {
@@ -54,7 +54,13 @@ impl WelcomeSocket {
                             warn!("Found incompatible client {hostname}! {reason}\n{protocols}");
                         }
 
-                        clients.insert(hostname.into(), address.to_ip_addr());
+                        // Clients that do not advertise a port use the well-known one.
+                        let control_port = info
+                            .get_property_val_str(alvr_sockets::MDNS_CONTROL_PORT_KEY)
+                            .and_then(|port| port.parse::<u16>().ok())
+                            .unwrap_or(alvr_sockets::CONTROL_PORT);
+
+                        clients.insert(hostname.into(), (address.to_ip_addr(), control_port));
                     }
                 }
                 Err(TryRecvError::Empty) => break,
