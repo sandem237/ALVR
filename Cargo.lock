@@ -478,6 +478,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "alvr_service"
+version = "21.0.0-dev12"
+dependencies = [
+ "alvr_common",
+ "alvr_filesystem",
+ "alvr_packets",
+ "alvr_server_core",
+ "alvr_server_io",
+ "alvr_service_protocol",
+ "alvr_session",
+ "serde_json",
+ "windows 0.58.0",
+]
+
+[[package]]
+name = "alvr_service_client"
+version = "21.0.0-dev12"
+dependencies = [
+ "alvr_service_protocol",
+ "windows 0.58.0",
+]
+
+[[package]]
+name = "alvr_service_protocol"
+version = "21.0.0-dev12"
+dependencies = [
+ "alvr_common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "alvr_session"
 version = "21.0.0-dev12"
 dependencies = [

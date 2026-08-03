@@ -119,13 +119,22 @@ pub async fn web_server(connection_context: Arc<ConnectionContext>) -> Result<()
         .layer(middleware::from_fn(ensure_preflight))
         .with_state(connection_context);
 
-    axum::serve(
-        TcpListener::bind(SocketAddr::new([0, 0, 0, 0].into(), web_server_port))
-            .await
-            .unwrap(),
-        router,
-    )
-    .await?;
+    // Do not panic if the port is taken: another ALVR process may already own it, and the streaming
+    // path does not depend on the web server. Losing the dashboard API is degraded, not fatal.
+    let listener = match TcpListener::bind(SocketAddr::new([0, 0, 0, 0].into(), web_server_port))
+        .await
+    {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!(
+                "Web server disabled: could not bind port {web_server_port} ({e}). \
+                 Another ALVR process is probably already using it."
+            );
+            return Ok(());
+        }
+    };
+
+    axum::serve(listener, router).await?;
 
     Ok(())
 }

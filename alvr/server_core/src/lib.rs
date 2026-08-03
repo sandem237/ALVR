@@ -292,6 +292,31 @@ pub fn settings() -> Settings {
     SESSION_MANAGER.read().settings().clone()
 }
 
+/// Every known client as `(hostname, display_name, connection_state)`.
+///
+/// Lets a backend mirror the session's client list without depending on the session types, which is
+/// what the multi-device service builds its device registry from.
+pub fn client_list_snapshot() -> Vec<(String, String, ConnectionState)> {
+    SESSION_MANAGER
+        .read()
+        .client_list()
+        .iter()
+        .map(|(hostname, config)| {
+            let display_name = if config.display_name.is_empty() {
+                hostname.clone()
+            } else {
+                config.display_name.clone()
+            };
+
+            (
+                hostname.clone(),
+                display_name,
+                config.connection_state.clone(),
+            )
+        })
+        .collect()
+}
+
 pub fn steamvr_hmd_init_config() -> SteamvrHmdInitConfig {
     SESSION_MANAGER
         .read()
