@@ -46,9 +46,47 @@ just a texture-source swap. The idle texture is static, so it costs one image an
 Confirmed feasible by Spike 2: the service can create and own the texture before any app exists, and a
 later-starting app can still attach to it by name.
 
-### IPC: control channel
+### IPC: control channel — ownership must be INVERTED for sandboxed UWP
 
-**Named pipe**, service is the listener:
+**The app creates the pipe; the service connects into it.** This is the opposite of the obvious
+"service listens" shape, and it is forced by AppContainer rules:
+
+- A sandboxed UWP app **cannot connect outward** to a desktop service's pipe. `CreateFile2` docs:
+  *"When called from a Windows Store app… **You can't open named pipes**."* And `ConnectNamedPipe`
+  docs: *"Windows 10, version 1709 and later: … named pipes within app-containers must use the syntax
+  `\\.\pipe\LOCAL\`"*, a namespace aliased per container.
+- A sandboxed UWP app **can create** a pipe server in its own namespace, and a desktop process can
+  connect to it by fully-qualified path — the same ownership direction the SimulatedReality reference
+  uses for its shared texture.
+
+Working reference: `github.com/hannesne/NamedPipesSample` ("Previously unsuccessful experiments to use
+named pipes in UWP. Can now use them to communicate between a console app and a UWP app").
+- UWP side: `NamedPipeServerStream` on `LOCAL\mypipe`.
+- Desktop side: `NamedPipeClientStream` on
+  `Sessions\{SessionId}\AppContainerNamedObjects\{PackageSid}\mypipe`.
+
+Consequence for us: the app must publish its **PID**, from which the service resolves the namespace
+root with `GetAppContainerNamedObjectPath`. Ridge solves this by **protocol/URI activation** —
+`ridge-sr-driver://connect?pid=1234` — which launches the desktop adapter and hands it the PID in one
+step. That is the rendezvous, and it is confirmed working in production.
+
+For ALVR the service is already running, so it does not need launching. The app still has to announce
+itself; options, cheapest first:
+1. The app writes its PID somewhere the service already watches (e.g. a file in a known location, or
+   the existing web API — the runtime can do an HTTP POST even from a sandbox with
+   `privateNetworkClientServer`).
+2. The orchestrator, which launches the app anyway, tells the service the PID it just spawned.
+3. Protocol activation of a tiny per-app broker, mirroring Ridge exactly.
+
+Option 2 fits the design best: the orchestrator already knows the PID because it started the app, and
+it is already a control-API client. **Decide before implementing.**
+
+Note the reference sample declares `runFullTrust`, so it does not by itself prove the fully sandboxed
+case; but the *direction* it demonstrates is what AppContainer rules require.
+
+### IPC: control channel — mechanics (independent of direction)
+
+**Named pipe**, message mode:
 
 - Service creates `\\.\pipe\Global\alvr_service` with a security descriptor granting
   `ALL_APPLICATION_PACKAGES` (`S-1-15-2-1`), so AppContainer (UWP) apps can open it. SDDL
@@ -64,8 +102,29 @@ later-starting app can still attach to it by name.
 - Each app gets its own private bidirectional channel — no multiplexing, no port allocation.
 - **Either side may start first**: the app retries until the pipe exists; the service replenishes
   instances as apps come and go.
-- **The app side must call `CreateFile2`, not `CreateFileW`** — the latter is not in the UWP API
-  surface and will not compile in an AppContainer project (verified, Spike 5).
+- **`FILE_FLAG_OVERLAPPED` is mandatory**, not an optimisation. All I/O on a *synchronous* handle is
+  serialized at the file-object level, so a pushed event's `WriteFile` queues behind an outstanding
+  `ReadFile` on the same handle and the two processes deadlock in a circular wait — the client blocks
+  reading, so the write never starts, so the read never completes. This is guaranteed, not a race.
+  Confirmed by measurement (events queued, never written) and by
+  [Raymond Chen](https://devblogs.microsoft.com/oldnewthing/20130822-00/?p=3433): *"All I/O on a
+  synchronous file handle is serialized."* Microsoft's pipe docs put it positively: *"Overlapped
+  operations make it possible for one pipe to read and write data simultaneously."*
+  - `PIPE_WAIT` is **not** the cause; the absence of `FILE_FLAG_OVERLAPPED` is.
+  - `DuplicateHandle` does **not** help: *"The duplicate handle refers to the same object as the
+    original handle."* Same file object, same lock, same hang.
+  - `PIPE_NOWAIT` is documented as deprecated for this purpose and must not be used.
+  - Overlapped requires a separate `OVERLAPPED` + its own event per concurrent operation; never wait
+    on the pipe handle itself; treat `ERROR_IO_PENDING` as success-pending and finish with
+    `GetOverlappedResult`. With an overlapped handle `ConnectNamedPipe` requires a non-NULL
+    `lpOverlapped`, and `ERROR_PIPE_CONNECTED` means *success*.
+  - **Prefer the `interprocess` crate** over hand-rolled `OVERLAPPED`: it forces overlapped I/O while
+    exposing a blocking API, and handles message mode correctly. Avoid tokio's named pipes here —
+    mio's readiness bridge uses a fixed 4 KiB buffer and *silently swallows* `ERROR_MORE_DATA`, so
+    message boundaries are lost above 4096 bytes with no error (tokio #5307, #6460).
+- **`CreateFileW` is unavailable to UWP** (`error C3861`, verified Spike 5). `CreateFile2` is the
+  compile-time replacement — but note it **cannot open named pipes** from a Store app either, which is
+  why the ownership direction above is inverted rather than just swapping the API.
 - Free liveness signal: reads fail `ERROR_BROKEN_PIPE` when an app dies, which releases its claim.
 
 Why not loopback TCP: the UWP loopback mechanism (`windows.loopbackAccessRules`) is keyed by
@@ -73,10 +132,41 @@ Why not loopback TCP: the UWP loopback mechanism (`windows.loopbackAccessRules`)
 fallback would be machine-wide `checknetisolation loopbackexempt`, requiring admin and manual upkeep.
 Pipes need one ACL'd object instead.
 
-### IPC: frame path
+### IPC: ownership direction — SETTLED, and it is the opposite of my first design
 
-**Service creates the shared texture, app opens it** — the reverse of the reference implementation
-(see below), chosen deliberately:
+> **The sandboxed (AppContainer) side CREATES every shared object. The full-trust desktop side OPENS
+> them, resolving the path from the app's PID.**
+
+Confirmed against Ridge/asgard production code, where the main app genuinely runs in an AppContainer:
+`SimulatedRealityRemoteSession::EnsureResources` (the **client**, inside the container) constructs the
+shared texture with a bare `SharedResourceName`; the **adapter** (a separately installed desktop app,
+launched by protocol invocation carrying the PID) opens it via
+`GetAppContainerNamedObjectPath`-resolved root.
+
+Why this direction and not the other:
+
+- A bare name created inside the container lands in the container's own object directory, where it has
+  full rights — so **no ACL code is needed at all**. This is why there is no SDDL anywhere in Ridge.
+- Pushing the other way does not work. Measured: an unelevated, unpackaged desktop process cannot even
+  `CreateFileMapping` for the app to open (`ACCESS_DENIED`), and `Global\` for sections/events needs
+  `SeCreateGlobalPrivilege` that a plain service lacks. (Pipes differ: there `Global\` is just part of
+  the name and needs no privilege.)
+- It also explains why the adapter exists as a separate desktop process at all, and why it is started
+  by URI with the PID: the app owns the objects, so the desktop side must be *told where to look*.
+
+Correction to earlier notes in this file: an earlier spike appeared to show "service creates, app
+opens" working, but that used an AppContainer-*simulated* child process and a DXGI shared handle, not
+a genuine packaged UWP app and not a section object. Ridge's direction is the one that holds in a real
+sandbox.
+
+Consequence for the idle "no signal" texture: the service can no longer own the texture, because it
+only exists while an app does. Idle content must therefore either be dropped (model **(b)**: stream
+stays connected, no content until an app attaches) or produced by a small always-running full-trust
+helper that owns its own surface. **Revisit this decision.**
+
+### IPC: frame path (superseded — see ownership direction above)
+
+Originally planned as **service creates the shared texture, app opens it**, for these reasons:
 
 - The idle texture must exist *before* any app does, which only works if the service owns it.
 - The service knows the headset's negotiated resolution, so it should define the texture size. This
