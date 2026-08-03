@@ -77,3 +77,9 @@ settings.local.json
 
 # standalone tool build output
 /tools/*/target
+
+# UWP test app build output
+/tools/uwp-ipc-test/x64
+/tools/uwp-ipc-test/AppPackages
+/tools/uwp-ipc-test/Generated Files
+/tools/uwp-ipc-test/*.user

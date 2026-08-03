@@ -62,8 +62,10 @@ later-starting app can still attach to it by name.
   instance. If no idle instance exists, a client's `CreateFile` fails `ERROR_PIPE_BUSY` (pipes do not
   queue), so always keep one pending.
 - Each app gets its own private bidirectional channel — no multiplexing, no port allocation.
-- **Either side may start first**: the app retries `CreateFile` / uses `WaitNamedPipe` until the pipe
-  exists; the service replenishes instances as apps come and go.
+- **Either side may start first**: the app retries until the pipe exists; the service replenishes
+  instances as apps come and go.
+- **The app side must call `CreateFile2`, not `CreateFileW`** — the latter is not in the UWP API
+  surface and will not compile in an AppContainer project (verified, Spike 5).
 - Free liveness signal: reads fail `ERROR_BROKEN_PIPE` when an app dies, which releases its claim.
 
 Why not loopback TCP: the UWP loopback mechanism (`windows.loopbackAccessRules`) is keyed by
@@ -220,12 +222,17 @@ can attach later. **Idle video (a) is viable.**
 This is the one that de-risks UWP, and it was run with a negative control so the result means
 something.
 
-**Method.** The VS UWP C++ workload is not installed, and installing it is a large machine-wide
-change. But a UWP app's security boundary *is* an AppContainer, so the harness tests the boundary
-directly: `CreateAppContainerProfile` (no extra capabilities — the strictest case) plus
-`STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` to launch a child inside it. The child
-confirms `TokenIsAppContainer = 1`, so it is subject to exactly the access checks a UWP app faces.
-Harness: `tools/appcontainer-run/`.
+**Method.** Two independent harnesses, because each catches something the other cannot.
+
+`tools/appcontainer-run/` fakes the sandbox: `CreateAppContainerProfile` (no extra capabilities — the
+strictest case) plus `STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` to launch a
+desktop binary inside a real AppContainer. The child confirms `TokenIsAppContainer = 1`, so it faces
+the same *access checks* a UWP app faces. Quick to iterate, and it supports a negative control.
+
+`tools/uwp-ipc-test/` is a **genuine packaged UWP app** (`ApplicationType = Windows Store`,
+`AppContainerApplication = true`, toolset v143, SDK 10.0.22621.0 — matching the asgard Holomaps
+client). This catches Store **API-surface** restrictions, which the AppContainer harness cannot,
+because that harness compiles against the desktop API surface.
 
 **Results, client running inside the AppContainer:**
 
@@ -239,13 +246,36 @@ Harness: `tools/appcontainer-run/`.
 The negative control is the important part: without the ACL the AppContainer is **denied**, so the
 `S-1-15-2-1` grant is genuinely what permits access, not some permissive default.
 
-Incidental but useful: the sandboxed child successfully created a **D3D11 hardware device** and drove
-a keyed mutex, so GPU access from an AppContainer is not itself a problem.
+**Results from the genuine packaged UWP app**, with the desktop counterparts running:
 
-**Caveat.** A packaged UWP app also needs its executable and working set reachable; here the harness
-had to `icacls /grant *S-1-15-2-1:(RX)` the directory holding the test binaries. A real UWP app gets
-this from its package layout, but the ALVR **runtime DLL** will be loaded from a path the app can
-already read, so nothing extra is required for our case. Only the two named objects need explicit ACLs.
+| Test | Evidence |
+|---|---|
+| Open `\\.\pipe\Global\alvr_spike1` | server logged `received 33 bytes: "hello from packaged UWP pid 13692"` |
+| `OpenSharedResourceByName` + keyed-mutex write | service logged `observed pixel change 0x00000000 -> 0xAAAAAAAA` |
+
+`0xAA` is the UWP app's own colour (the AppContainer harness writes `0xFF`), so that pixel change is
+unambiguously the UWP app's write. **No capabilities are declared in its manifest**, confirming the
+design's claim that only the service-side ACL is required.
+
+Incidental but useful: the sandboxed app created a **D3D11 hardware device** and drove a keyed mutex,
+so GPU access from a UWP AppContainer is not itself a problem.
+
+### Finding — `CreateFileW` is not in the UWP API surface
+
+Only the real UWP build caught this. `CreateFileW` **fails to compile** in an
+`AppContainerApplication` project (`error C3861: 'CreateFileW': identifier not found`);
+**`CreateFile2` is the supported equivalent**, so the ALVR OpenXR runtime must use it on the app side
+of the pipe. The AppContainer harness compiled `CreateFileW` happily, because it builds against the
+desktop API surface — which is precisely why both harnesses are worth keeping.
+
+Other UWP project gotchas worth recording (all in `tools/uwp-ipc-test/README.md`):
+`CompileAsWinRT=false` is required for C++/WinRT (otherwise `vccorlib` demands a C++/CX
+`main(Platform::Array<String^>^)` and the link fails); the entry point is `wWinMain`; and
+`mp:PhoneIdentity` is mandatory or packaging fails with `APPX1673`.
+
+**Correction to an earlier claim:** I previously reported the VS UWP C++ workload as missing. It is
+installed — the targets live under `MSBuild\Microsoft\VC\v170\Application Type\Windows Store`, not the
+`Platforms\UAP` path I checked. The asgard Holomaps client builds with it.
 
 ### Spike 3 — `GetAppContainerNamedObjectPath` from unpackaged — **NOT NEEDED**
 

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+  IgnorableNamespaces="uap rescap mp">
+
+  <Identity
+    Name="ALVR.UwpIpcTest"
+    Publisher="CN=ALVR Test"
+    Version="1.0.0.0" />
+
+  <mp:PhoneIdentity PhoneProductId="9a1e4c77-3b21-4e8a-9c55-1d2f6a8b4e01"
+                    PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+
+  <Properties>
+    <DisplayName>ALVR UWP IPC Test</DisplayName>
+    <PublisherDisplayName>ALVR</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.19041.0" MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="App" Executable="alvr_uwp_ipc_test.exe" EntryPoint="alvr_uwp_ipc_test.App">
+      <uap:VisualElements
+        DisplayName="ALVR UWP IPC Test"
+        Description="Verifies the ALVR service named pipe and shared texture are reachable from a UWP AppContainer"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- Deliberately minimal. The whole point of the test is that reaching the service's named
+         objects requires only the service-side S-1-15-2-1 ACL, not a special app capability.
+         If this app needs extra capabilities to pass, that is a finding worth knowing. -->
+  </Capabilities>
+</Package>
