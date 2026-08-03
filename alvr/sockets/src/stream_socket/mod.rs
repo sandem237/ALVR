@@ -303,7 +303,9 @@ impl StreamSocketBuilder {
     ) -> ConResult<StreamSocket> {
         let (send_socket, receive_socket) = match protocol {
             SocketProtocol::Udp => {
-                let socket = udp::bind(port, dscp, buffer_config).to_con()?;
+                // Reusable so that several clients can be served from the same local stream port.
+                // Each socket is connected to one client, so datagrams still demultiplex per client.
+                let socket = udp::bind_reusable(port, dscp, buffer_config).to_con()?;
                 udp::connect(&socket, client_ip, port, timeout).to_con()?;
                 udp::split_multiplexed(socket, max_packet_size).to_con()?
             }

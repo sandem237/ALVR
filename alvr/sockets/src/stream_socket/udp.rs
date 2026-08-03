@@ -4,13 +4,13 @@ use super::{
 use crate::LOCAL_IP;
 use alvr_common::{ConResult, HandleTryAgain, ToCon, anyhow::Result};
 use alvr_session::{DscpTos, SocketBufferConfig};
-use socket2::{MaybeUninitSlice, Socket};
+use socket2::{Domain, MaybeUninitSlice, Protocol, Socket, Type};
 use std::ffi::c_int;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     mem::{self, MaybeUninit},
-    net::{IpAddr, UdpSocket},
+    net::{IpAddr, SocketAddr, UdpSocket},
     ptr,
     time::Duration,
 };
@@ -43,6 +43,37 @@ pub fn bind(
     buffer_config: SocketBufferConfig,
 ) -> Result<UdpSocket> {
     let socket = UdpSocket::bind((LOCAL_IP, port))?.into();
+
+    crate::set_socket_buffers(&socket, buffer_config).ok();
+    crate::set_dscp(&socket, dscp);
+
+    Ok(socket.into())
+}
+
+/// Binds the local stream port so that several clients can be served from it at once.
+///
+/// The plain [`bind`] fails with `EADDRINUSE` for a second client, because the server binds a fixed
+/// local port before connecting. Address reuse is safe here: each socket is then `connect`ed to a
+/// distinct client address, so the kernel delivers each client's datagrams to its own socket.
+pub fn bind_reusable(
+    port: u16,
+    dscp: Option<DscpTos>,
+    buffer_config: SocketBufferConfig,
+) -> Result<UdpSocket> {
+    let address = SocketAddr::new(LOCAL_IP, port);
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+
+    // Must be set before bind. SO_REUSEPORT does not exist on Windows, where SO_REUSEADDR alone
+    // already allows binding an address that is in use.
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+
+    socket.bind(&address.into())?;
 
     crate::set_socket_buffers(&socket, buffer_config).ok();
     crate::set_dscp(&socket, dscp);
