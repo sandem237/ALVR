@@ -198,9 +198,8 @@ the single, machine-wide pipe namespace. Enumerating `\\.\pipe\` shows the objec
 reported it as "present but NOT enabled" and creation still succeeded. So the service does **not** need
 to be elevated or a Windows service.
 
-**Still unproven:** opening from a genuine AppContainer. The ACL is applied and the desktop path works,
-but only a real UWP test app can confirm the `S-1-15-2-1` grant is honoured. Deferred to the UWP test
-app in Phase 3 — the mechanism is standard, so this is verification rather than a design risk.
+**AppContainer verified — see Spike 5.** A client running inside a real AppContainer opened the pipe
+and delivered its message.
 
 ### Spike 2 — service-created named shared texture, app-opened — **PASS**
 
@@ -215,6 +214,38 @@ The design's reversed ownership direction works, end to end:
 
 This confirms the service can own the idle "no signal" texture before any app exists, and that apps
 can attach later. **Idle video (a) is viable.**
+
+### Spike 5 — both channels from inside a real AppContainer — **PASS**
+
+This is the one that de-risks UWP, and it was run with a negative control so the result means
+something.
+
+**Method.** The VS UWP C++ workload is not installed, and installing it is a large machine-wide
+change. But a UWP app's security boundary *is* an AppContainer, so the harness tests the boundary
+directly: `CreateAppContainerProfile` (no extra capabilities — the strictest case) plus
+`STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` to launch a child inside it. The child
+confirms `TokenIsAppContainer = 1`, so it is subject to exactly the access checks a UWP app faces.
+Harness: `tools/appcontainer-run/`.
+
+**Results, client running inside the AppContainer:**
+
+| Test | Result |
+|---|---|
+| Open `\\.\pipe\Global\alvr_spike1` **with** `S-1-15-2-1` ACL | **PASS** — connected, message received |
+| Same pipe **without** the ACL (negative control) | **Access is denied** (`0x80070005`) |
+| `OpenSharedResourceByName` on the ACL'd shared texture | **PASS** — opened |
+| Keyed-mutex acquire/release + pixel write from the sandbox | **PASS** — service observed `0x00000000 → 0xFFFFFFFF` |
+
+The negative control is the important part: without the ACL the AppContainer is **denied**, so the
+`S-1-15-2-1` grant is genuinely what permits access, not some permissive default.
+
+Incidental but useful: the sandboxed child successfully created a **D3D11 hardware device** and drove
+a keyed mutex, so GPU access from an AppContainer is not itself a problem.
+
+**Caveat.** A packaged UWP app also needs its executable and working set reachable; here the harness
+had to `icacls /grant *S-1-15-2-1:(RX)` the directory holding the test binaries. A real UWP app gets
+this from its package layout, but the ALVR **runtime DLL** will be loaded from a path the app can
+already read, so nothing extra is required for our case. Only the two named objects need explicit ACLs.
 
 ### Spike 3 — `GetAppContainerNamedObjectPath` from unpackaged — **NOT NEEDED**
 
