@@ -183,6 +183,10 @@ pub struct ConnectionContext {
     video_mirror_sender: Mutex<Option<broadcast::Sender<Vec<u8>>>>,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
+    /// Whether a client negotiating different resolution/refresh rate should restart the whole
+    /// driver. Required for SteamVR, which fixes those at driver startup. Backends that reconfigure
+    /// per client must leave this off: a restart would tear down every other client's session.
+    restart_on_settings_change: bool,
 }
 
 impl ConnectionContext {
@@ -312,8 +316,29 @@ pub struct ServerCoreContext {
     webserver_runtime: Option<Runtime>,
 }
 
+/// How a backend wants the server core to behave.
+pub struct ServerCoreConfig {
+    /// Restart the driver when a client negotiates a different resolution or refresh rate. SteamVR
+    /// needs this because it fixes those at driver startup. Backends that can reconfigure per client
+    /// must leave this off, since a restart tears down every other connected client.
+    pub restart_on_settings_change: bool,
+}
+
+impl Default for ServerCoreConfig {
+    fn default() -> Self {
+        // Matches the historical SteamVR behaviour.
+        Self {
+            restart_on_settings_change: true,
+        }
+    }
+}
+
 impl ServerCoreContext {
     pub fn new() -> (Self, mpsc::Receiver<ServerCoreEvent>) {
+        Self::with_config(ServerCoreConfig::default())
+    }
+
+    pub fn with_config(config: ServerCoreConfig) -> (Self, mpsc::Receiver<ServerCoreEvent>) {
         dbg_server_core!("Creating");
 
         if SESSION_MANAGER
@@ -337,6 +362,7 @@ impl ServerCoreContext {
             video_mirror_sender: Mutex::new(None),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
+            restart_on_settings_change: config.restart_on_settings_change,
         });
 
         let webserver_runtime = Runtime::new().unwrap();
@@ -367,6 +393,24 @@ impl ServerCoreContext {
         *self.connection_thread.write() = Some(thread::spawn(move || {
             connection::handshake_loop(connection_context, lifecycle_state);
         }));
+    }
+
+    /// Hostnames of the clients that currently have a streaming session.
+    pub fn connected_clients(&self) -> Vec<String> {
+        self.connection_context
+            .client_sessions()
+            .into_iter()
+            .map(|session| session.hostname.clone())
+            .collect()
+    }
+
+    /// Requests a single client to disconnect, leaving other clients streaming. The streaming
+    /// threads observe this state change and shut themselves down.
+    pub fn disconnect_client(&self, hostname: &str) {
+        SESSION_MANAGER.write().update_client_connections(
+            hostname.to_owned(),
+            ClientConnectionsAction::SetConnectionState(ConnectionState::Disconnecting),
+        );
     }
 
     pub fn get_device_motion(
@@ -488,6 +532,32 @@ impl ServerCoreContext {
             return;
         };
 
+        Self::set_session_video_config(&session, config_buffer, codec);
+    }
+
+    /// Sets the decoder config for one specific client, for backends driving several headsets.
+    pub fn set_video_config_nals_for_client(
+        &self,
+        client_id: &str,
+        config_buffer: Vec<u8>,
+        codec: CodecType,
+    ) {
+        if let Some(sender) = &*self.connection_context.video_mirror_sender.lock() {
+            sender.send(config_buffer.clone()).ok();
+        }
+
+        let Some(session) = self.connection_context.client_session(client_id) else {
+            return;
+        };
+
+        Self::set_session_video_config(&session, config_buffer, codec);
+    }
+
+    fn set_session_video_config(
+        session: &ClientSession,
+        config_buffer: Vec<u8>,
+        codec: CodecType,
+    ) {
         if let Some(file) = &mut *session.video_recording_file.lock() {
             file.write_all(&config_buffer).ok();
         }
@@ -499,6 +569,7 @@ impl ServerCoreContext {
         });
     }
 
+    /// Sends video to the client the single-HMD backend is bound to.
     pub fn send_video_nal(
         &self,
         timestamp: Duration,
@@ -512,6 +583,34 @@ impl ServerCoreContext {
             return;
         };
 
+        self.send_video_nal_to_session(&session, timestamp, global_view_params, is_idr, nal_buffer);
+    }
+
+    /// Sends video to one specific client. Backends that drive several headsets at once encode per
+    /// client and use this instead of [`Self::send_video_nal`].
+    pub fn send_video_nal_to_client(
+        &self,
+        client_id: &str,
+        timestamp: Duration,
+        global_view_params: [ViewParams; 2],
+        is_idr: bool,
+        nal_buffer: Vec<u8>,
+    ) {
+        let Some(session) = self.connection_context.client_session(client_id) else {
+            return;
+        };
+
+        self.send_video_nal_to_session(&session, timestamp, global_view_params, is_idr, nal_buffer);
+    }
+
+    fn send_video_nal_to_session(
+        &self,
+        session: &ClientSession,
+        timestamp: Duration,
+        global_view_params: [ViewParams; 2],
+        is_idr: bool,
+        nal_buffer: Vec<u8>,
+    ) {
         if let Some(sender) = &*session.video_channel_sender.lock() {
             let buffer_size = nal_buffer.len();
 
@@ -536,7 +635,7 @@ impl ServerCoreContext {
                 if is_idr {
                     create_recording_file(
                         &self.connection_context,
-                        &session,
+                        session,
                         SESSION_MANAGER.read().settings(),
                     );
                     *session.last_idr_instant.lock() = Instant::now();

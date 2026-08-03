@@ -8,6 +8,8 @@ pub struct AnnouncerSocket {
 }
 
 impl AnnouncerSocket {
+    /// Announces on the well-known [`alvr_sockets::CONTROL_PORT`].
+    #[allow(dead_code)] // Kept for callers that do not need a custom control port.
     pub fn new(hostname: &str) -> Result<Self> {
         Self::new_with_control_port(hostname, alvr_sockets::CONTROL_PORT)
     }

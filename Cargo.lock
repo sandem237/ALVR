@@ -393,6 +393,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "alvr_mock_server"
+version = "21.0.0-dev12"
+dependencies = [
+ "alvr_common",
+ "alvr_filesystem",
+ "alvr_packets",
+ "alvr_server_core",
+ "alvr_server_io",
+ "alvr_session",
+ "serde_json",
+]
+
+[[package]]
 name = "alvr_packets"
 version = "21.0.0-dev12"
 dependencies = [

@@ -798,19 +798,26 @@ fn connection_pipeline(
         target_eye_resolution_height: emulated_headset_view_resolution.y,
         refresh_rate: fps as _,
     };
+    // SteamVR bakes the HMD resolution and refresh rate in at driver startup, so when a client
+    // negotiates different ones the whole driver has to restart. Backends that can reconfigure
+    // per client (and can serve several headsets at once) must not do this: restarting would kill
+    // every other client's session, and with heterogeneous headsets it would restart-loop forever.
     let new_hash = compute_restart_settings_hash(&new_steamvr_hmd_init_config, &initial_settings);
     if session_manager_lock.session().restart_settings_hash != new_hash {
         let mut session = session_manager_lock.session_mut();
         session.steamvr_hmd_init_config = new_steamvr_hmd_init_config;
         session.restart_settings_hash = new_hash;
+        drop(session);
 
-        alvr_sockets::send_restart_signal(socket, stream_config_packet)?;
+        if ctx.restart_on_settings_change {
+            alvr_sockets::send_restart_signal(socket, stream_config_packet)?;
 
-        crate::notify_restart_driver();
+            crate::notify_restart_driver();
 
-        *lifecycle_state.write() = LifecycleState::ShuttingDown;
+            *lifecycle_state.write() = LifecycleState::ShuttingDown;
 
-        return Ok(());
+            return Ok(());
+        }
     }
 
     let stream_protocol = if wired {

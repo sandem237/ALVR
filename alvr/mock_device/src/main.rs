@@ -95,8 +95,23 @@ impl Args {
             idx += 1;
         }
 
+        // mdns-sd rejects hostnames that do not end in ".local.", and registration failing means
+        // the device never announces itself at all. Real clients default to "NNNN.client.local.",
+        // so append the same suffix rather than making the caller remember it.
+        let hostname = hostname
+            .ok_or_else(|| format!("--hostname is required\n\n{}", usage()))?
+            .trim_end_matches('.')
+            .to_owned();
+        let hostname = if hostname.ends_with(".local") {
+            format!("{hostname}.")
+        } else if hostname.ends_with(".client") {
+            format!("{hostname}.local.")
+        } else {
+            format!("{hostname}.client.local.")
+        };
+
         Ok(Self {
-            hostname: hostname.ok_or_else(|| format!("--hostname is required\n\n{}", usage()))?,
+            hostname,
             control_port,
             view_resolution: UVec2::new(width, height),
             refresh_rate,
