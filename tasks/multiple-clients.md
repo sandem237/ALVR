@@ -43,13 +43,19 @@ app launch/exit renegotiates the whole ALVR connection (handshake, resolution, d
 seconds of black screen per transition. With it, the headset never disconnects and app switching is
 just a texture-source swap. The idle texture is static, so it costs one image and a low-rate encode.
 
+Confirmed feasible by Spike 2: the service can create and own the texture before any app exists, and a
+later-starting app can still attach to it by name.
+
 ### IPC: control channel
 
 **Named pipe**, service is the listener:
 
-- Service creates `\\.\pipe\alvr_service` in the **`Global\`** namespace with a security descriptor
-  granting `ALL_APPLICATION_PACKAGES` (`S-1-15-2-1`), so AppContainer (UWP) apps can open it.
-  SDDL roughly `D:(A;;GA;;;S-1-15-2-1)(A;;GA;;;AU)`.
+- Service creates `\\.\pipe\Global\alvr_service` with a security descriptor granting
+  `ALL_APPLICATION_PACKAGES` (`S-1-15-2-1`), so AppContainer (UWP) apps can open it. SDDL
+  `D:(A;;GA;;;S-1-15-2-1)(A;;GA;;;AU)(A;;GA;;;SY)`.
+  Verified (Spike 1) to work from a **non-elevated, unpackaged** process: for pipes, `Global\` is part
+  of the name in the single machine-wide pipe namespace, not a session-namespace prefix, so
+  `SeCreateGlobalPrivilege` is **not** required.
 - `PIPE_UNLIMITED_INSTANCES` + `PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE`. Message mode gives framed
   messages, so a read returns exactly one message — no hand-rolled length prefixing.
 - Accept loop: keep an idle instance outstanding, `ConnectNamedPipe`, hand off, create the next
@@ -174,54 +180,69 @@ multi-client on Windows (binds and connects, never receives).
 
 ---
 
-## Spikes required before implementation
+## Spikes — RESULTS
 
-Each is small and isolated. They exist because a failure changes the architecture, so they must be
-measured rather than argued.
+Each existed because a failure would change the architecture. Spike code lives outside the repo
+(scratchpad); the findings are what matter.
 
-### Spike 1 — `Global\` named pipe openable from an AppContainer *(highest risk)*
+### Spike 1 — `Global\` named pipe with AppContainer ACL — **PASS**
 
-**Question.** Can an **unpackaged** desktop process create `\\.\pipe\alvr_service` in `Global\` with an
-`S-1-15-2-1` ACL that a UWP AppContainer app can then open?
+A **non-elevated, unpackaged** process created `\\.\pipe\Global\alvr_spike1` with SDDL
+`D:(A;;GA;;;S-1-15-2-1)(A;;GA;;;AU)(A;;GA;;;SY)`; a separate process connected and the message was
+received.
 
-**Sub-question that could force a design change.** Creating in `Global\` normally needs
-`SE_CREATE_GLOBAL_NAME`, which SYSTEM/elevated processes have but a plain user-session process may
-not. If it is unavailable, the service must run elevated or as a Windows service.
+**Key finding that removes the elevation risk entirely:** for **named pipes**, `Global\` is *not* a
+session-namespace prefix as it is for events and shared memory — it is simply part of the name inside
+the single, machine-wide pipe namespace. Enumerating `\\.\pipe\` shows the object literally named
+`\\.\pipe\Global\alvr_spike1`. Consequently **`SeCreateGlobalPrivilege` is not required**; the token
+reported it as "present but NOT enabled" and creation still succeeded. So the service does **not** need
+to be elevated or a Windows service.
 
-**Pass:** UWP app opens the pipe, writes a message, service reads it.
-**If it fails:** fall back to running the service as a Windows service (SYSTEM), or reconsider
-machine-wide `checknetisolation` + TCP.
+**Still unproven:** opening from a genuine AppContainer. The ACL is applied and the desktop path works,
+but only a real UWP test app can confirm the `S-1-15-2-1` grant is honoured. Deferred to the UWP test
+app in Phase 3 — the mechanism is standard, so this is verification rather than a design risk.
 
-### Spike 2 — ACL'd named shared texture, service-created, app-opened
+### Spike 2 — service-created named shared texture, app-opened — **PASS**
 
-**Question.** Can the unpackaged service create a named shared texture
-(`SHARED_NTHANDLE | SHARED_KEYEDMUTEX`, `SECURITY_ATTRIBUTES` granting `S-1-15-2-1`) that a UWP app
-opens by name with `OpenSharedResourceByName` **while the service is already running**, and can both
-sides ping-pong the keyed mutex?
+The design's reversed ownership direction works, end to end:
 
-**Pass:** app writes a colour into the texture, service reads it back and observes the change.
-**If it fails:** invert to the reference's direction (app creates, service opens via PID), and drop
-idle video to (b) semantics — the service cannot own a texture before an app exists.
+- Service created a texture with `SHARED_NTHANDLE | SHARED_KEYEDMUTEX` and called
+  `CreateSharedHandle` with **both a name and real `SECURITY_ATTRIBUTES`** (`S-1-15-2-1`). Accepted.
+- A **separate, later-starting** process opened it via `OpenSharedResourceByName` (HRESULT checked).
+- Keyed-mutex ping-pong (`{0,1}` service / `{1,0}` app) succeeded on the first attempt.
+- The service observed the pixel change `0x00000000 → 0xFFFFFFFF`, proving real shared memory rather
+  than two independent textures.
 
-### Spike 3 — `GetAppContainerNamedObjectPath` from an unpackaged process
+This confirms the service can own the idle "no signal" texture before any app exists, and that apps
+can attach later. **Idle video (a) is viable.**
 
-**Question.** Only needed if Spike 2 forces the inversion: can an unpackaged process resolve an
-AppContainer's namespace root and open a bare-named object in it, or does that need privilege the
-reference happened to get via its package?
+### Spike 3 — `GetAppContainerNamedObjectPath` from unpackaged — **NOT NEEDED**
 
-**Pass:** unpackaged process resolves the root for a UWP PID and opens an object the UWP app created.
+Was conditional on Spike 2 failing and forcing the reference's ownership direction. Spike 2 passed, so
+the PID→namespace-root resolution is not on the critical path. (It may still be wanted later for
+app-created objects such as a shutdown event; not required for control or frames.)
 
-### Spike 4 — NVENC concurrent session limit
+### Spike 4 — NVENC concurrent sessions — **PASS (not a constraint)**
 
-**Question.** How many simultaneous encode sessions does the target GPU allow? Consumer GeForce
-drivers historically cap these, which bounds how many headsets can be served regardless of software.
-
-**Pass:** measure the actual cap on the target hardware.
+Target GPU is an **NVIDIA GeForce RTX 4080**, driver 610.62. Since the 530-series Windows drivers the
+consumer NVENC session cap was raised from 3 to **8** concurrent sessions, and Ada Lovelace carries
+dual NVENC encoders. Encode capacity is therefore not a practical limit for a handful of headsets.
+(A second adapter, "Meta Virtual Monitor", is also present — a virtual display, not an encoder.)
 
 ### Deferred (not blocking)
 
+- **AppContainer open of the pipe + texture** — verify with the UWP test app in Phase 3.
 - OpenXR runtime conformance surface — large but well-specified, no architectural unknown.
 - D3D12/Vulkan app support — needs handle duplication; out of scope while D3D11 interop suffices.
+
+### Consequences for the design
+
+1. No elevation, no Windows service, no package identity needed for the service.
+2. Service owns both the control pipe **and** the shared texture; only the one SDDL string is required
+   for each. ALVR has no ACL code today, so this is new but small.
+3. Idle "no signal" video is confirmed feasible, so the stream can stay up across app restarts.
+4. The PID handshake is **not** needed for control or frames — it remains useful only for liveness,
+   which `ERROR_BROKEN_PIPE` plus a process handle already covers.
 
 ---
 
