@@ -7,6 +7,7 @@
 use crate::{
     camera::{Camera, IPD},
     decoder::{self, DecodedFrame, DecoderKind, VideoDecoder},
+    hands::JOINT_COUNT,
 };
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
@@ -116,6 +117,28 @@ impl Default for TrackedController {
     }
 }
 
+/// State of one emulated hand, as the tracking thread sends it.
+///
+/// Head-relative for the same reason the controllers are: the tracking thread composes the joints
+/// with the head pose going out in the same packet, so the hand is exactly rigid against the view
+/// at any blend factor.
+#[derive(Clone, Copy)]
+pub struct TrackedHand {
+    pub enabled: bool,
+    /// The 26 joints of `XR_EXT_hand_tracking`, relative to the head pose in the same
+    /// [`TrackedState`].
+    pub joints: [Pose; JOINT_COUNT],
+}
+
+impl Default for TrackedHand {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            joints: [Pose::IDENTITY; JOINT_COUNT],
+        }
+    }
+}
+
 /// Everything the tracking thread sends, written by the UI thread as one value.
 ///
 /// One value on purpose: with the head and the controllers in separate slots, a tracking packet
@@ -126,6 +149,9 @@ pub struct TrackedState {
     pub head: TrackedPose,
     /// Left is index 0.
     pub controllers: [TrackedController; 2],
+    /// Left is index 0. A hand and a controller are mutually exclusive on a side, as they are on
+    /// a real headset, so at most one of the two entries for a side is enabled.
+    pub hands: [TrackedHand; 2],
 }
 
 /// The recently published states with the instants they were published at, so the tracking thread
@@ -855,10 +881,24 @@ fn tracking_loop(
             }
         }
 
+        // An enabled hand travels as a skeleton and *no* device motion for that side, which is
+        // exactly what `client_openxr` sends for a freely tracked hand. That absence is what the
+        // server keys on: `tracking_loop` only runs its gesture recognition for a hand whose
+        // device motion is missing, and the driver derives the device pose from the skeleton's
+        // palm joint instead. Sending both would be the multimodal case, where the hand is holding
+        // a controller.
+        let hand_skeletons = std::array::from_fn(|hand| {
+            let tracked = &tracked.hands[hand];
+
+            tracked
+                .enabled
+                .then(|| tracked.joints.map(|joint| head_pose * joint))
+        });
+
         context.send_tracking(TrackingData {
             poll_timestamp: origin.elapsed(),
             device_motions,
-            hand_skeletons: [None, None],
+            hand_skeletons,
             face: FaceData::default(),
             body: None,
         });
@@ -913,6 +953,29 @@ fn interpolate_state(previous: &TrackedState, current: &TrackedState, alpha: f32
                     orientation: old.pose.orientation.slerp(new.pose.orientation, alpha),
                     position: old.pose.position.lerp(new.pose.position, alpha),
                 },
+            }
+        }),
+        hands: std::array::from_fn(|hand| {
+            let old = &previous.hands[hand];
+            let new = &current.hands[hand];
+
+            // As with the controllers, a hand that just appeared has no previous pose worth
+            // blending from. Every joint blends by the same factor, so a hand mid-gesture stays a
+            // hand rather than coming apart between samples.
+            if !(old.enabled && new.enabled) {
+                return *new;
+            }
+
+            TrackedHand {
+                enabled: true,
+                joints: std::array::from_fn(|joint| Pose {
+                    orientation: old.joints[joint]
+                        .orientation
+                        .slerp(new.joints[joint].orientation, alpha),
+                    position: old.joints[joint]
+                        .position
+                        .lerp(new.joints[joint].position, alpha),
+                }),
             }
         }),
     }

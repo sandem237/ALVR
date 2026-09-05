@@ -22,6 +22,11 @@ existing clients working unchanged; see "ALVR changes" below.
 - **Emulates motion controllers.** Either controller can be enabled independently, posed in 6DoF,
   and driven through every button and axis the selected controller type has, from the mouse or from
   the HTTP API. The server treats them as real controllers; SteamVR renders and reacts to them.
+- **Emulates hand tracking.** Either hand can be enabled instead of its controller, posed in 6DoF,
+  put into a pose from a user-editable library, or made to perform a timed gesture built from those
+  poses. The full 26-joint skeleton goes on the wire,
+  so SteamVR sees hand tracking devices rather than controllers, and the emulator draws the hands
+  as skinned models from the very joints it is sending.
 
 ### Video decoding
 
@@ -115,24 +120,30 @@ frame pacing, head speed and decoded frame count. The same numbers are in `GET /
 
 ## Controller emulation
 
-The **Inputs** toolbar row controls the emulated controllers: **L** and **R** enable each hand
-independently, the dropdown selects which controller type to emulate, **Display** shows the 3D
-models in the scene view, and **Reset** returns poses and inputs to their defaults.
+The **Inputs** toolbar row controls both emulated controllers and emulated hands. Its controller
+section: **L** and **R** enable each hand independently, the dropdown selects which controller type
+to emulate, **Display** shows the 3D models in the scene view, and **Reset** returns poses and
+inputs to their defaults.
 
-Enabled controllers appear as **L**/**R** icons projected over the 3D view at their position; when
-the controller is outside the view the icon sticks to the edge with an arrow pointing towards it.
-Hovering an icon — including an edge-clamped one, which is how an off-screen controller is brought
-back — opens the movement panel underneath, four drag pads that pose the controller:
+A side is emulated as a controller **or** as a hand, never both, exactly as a real headset reports
+one or the other. Switching a controller on therefore switches that side's hand off, and vice
+versa. Switching one off does not bring the other back, so the toggle always means the same thing.
+
+Enabled devices appear as **LC**/**RC** icons (**LH**/**RH** for hands) projected over the 3D view
+at their position; when the device is outside the view the icon sticks to the edge with an arrow
+pointing towards it. Hovering an icon — including an edge-clamped one, which is how an off-screen
+device is brought back — opens the movement panel underneath, four drag pads that pose it:
 
 | Pad | Drag | Effect |
 |---|---|---|
 | Move | 2D | Translate on the vertical plane facing the head (drag maps 1:1 to on-screen motion) |
-| Depth | vertical | Move towards / away from the head |
-| Roll | horizontal | Roll around the controller's own forward axis |
+| Depth | vertical | Reach out along where the device points, so aiming at something and dragging up touches it. Right-drag moves towards / away from the head instead |
+| Roll | horizontal | Roll around the device's own forward axis |
 | Aim | 2D | Yaw and pitch in head space, with configurable sensitivity |
 
-Poses are head-relative, so controllers ride along as the camera moves and turns. The axes follow
-ALVR's convention: X right, Y up, -Z forward, origin at the head.
+Poses are head-relative, so devices ride along as the camera moves and turns. The axes follow
+ALVR's convention: X right, Y up, -Z forward, origin at the head. For a hand the pose is the
+**palm**, which is where OpenXR puts the hand's root joint.
 
 While a controller is enabled, a panel mimicking its physical layout sits in the matching bottom
 corner: trigger on top filling downwards as it is pulled, the grip as a bar on the inner edge
@@ -203,6 +214,256 @@ Wand, Pico Neo3 / 4 / 4S / G3, PSVR2 Sense, Vive Focus 3 and YVR. New profiles c
 as they use inputs from that set — unknown inputs are ignored with a warning. Note the emulator
 reports inputs exactly as the real controller would; any remapping to the server's configured
 emulation mode happens on the server, as with real hardware.
+
+## Hand emulation
+
+The **Hand** section of the **Inputs** row mirrors the controller one: **L** and **R** enable each
+hand, **Display** shows the 3D models, **Reset** returns the pose and the gesture to their
+defaults. Hands are posed with the same icons and the same movement panel as controllers, and
+excluded against them per side as described above.
+
+What differs is what is being emulated. A controller sends buttons; a hand sends **the 26 joint
+poses of OpenXR's `XR_EXT_hand_tracking`** and *no* device motion for that side, which is exactly
+what `client_openxr` sends for a freely tracked hand. That absence is what the server keys on: it
+runs its gesture recognition only for a hand whose device motion is missing, and the driver derives
+the SteamVR device pose from the skeleton's palm joint. Verified against a running SteamVR: with
+both hands on, the emulated controller devices go invalid and two hand-tracking devices appear,
+posed by the emulator; switching a side back to a controller reverses it.
+
+While a hand is enabled, a panel sits in the matching bottom corner holding two grids separated by
+a rule:
+
+- **Poses** — how the hand is held. Clicking one moves the hand into it over a configurable time
+  (0.5 s by default), eased in and out.
+- **Gestures** — what the hand *does*: a timed sequence of those poses. Clicking one plays it
+  through and leaves the hand in whatever pose it ended on.
+
+Gestures sit on the *inner* side of each panel, nearer the middle of the view, so the two hands'
+panels mirror each other and what you reach for most often is closest to the scene. The running
+pose change or gesture fills a bar along the bottom of its button.
+
+Each button draws the articulation it selects, rendered from its own joints — so anything added to
+`hands.json` gets a correct icon without artwork, and an icon cannot drift from what it does. A
+gesture is drawn as the keyframe furthest from the one it starts in, since a click drawn at its
+starting point would be indistinguishable from the pose it starts in, and carries a small play mark
+to set it apart from a pose. Tooltips carry the name and description.
+
+### Gestures
+
+A pose alone cannot express a tap. Holding a pinch and releasing it by hand means getting the
+timing right with the mouse, which is fiddly and not repeatable — so a gesture is a keyframed path
+through the poses over a fixed duration:
+
+```json
+{
+  "name": "Click",
+  "description": "Pinch and release while pointing, which is a trigger click",
+  "duration_seconds": 0.5,
+  "keyframes": [
+    { "pose": "Point",  "phase": 0.0 },
+    { "pose": "Pinch",  "phase": 0.5 },
+    { "pose": "Point",  "phase": 1.0 }
+  ]
+}
+```
+
+`phase` runs 0 at the start to 1 at the end, and each segment eases in and out so a tap accelerates
+away from one pose and settles into the next the way a finger does. Playing a gesture that is
+already running restarts it, which is what makes a click button repeatable without waiting.
+
+Two are provided: **Click** and **Double**. Only momentary ones, deliberately — anything a gesture
+would merely *arrive* at, such as a closed fist or a held pinch, is already a pose, and shipping it
+as a gesture too would put the same thing in both grids. A gesture naming a pose that does not
+exist is dropped at load with a warning rather than played as a flat hand.
+
+### How a pose is described
+
+Posing 26 joints directly would mean 26 free rotations, most combinations of which are not hands.
+A pose is therefore seven numbers, all `0`..`1`, and the joint angles follow from them:
+
+| Field | Meaning |
+|---|---|
+| `thumb`, `index`, `middle`, `ring`, `little` | Curl of each digit: 0 extended, 1 fully curled. Spread across that finger's knuckles the way the tendons do — roughly 85° at the knuckle, 100° at the middle joint, 68° at the fingertip joint |
+| `spread` | 0 fingers together, 1 fully splayed. Fans the knuckles about the palm normal |
+| `thumb_opposition` | 0 lies alongside the fingers in the plane of the palm, 1 is fully opposed across the palm with the pad facing the fingertips. Applies curled or not |
+
+This is the design's parameterisation with two refinements. Splay is attenuated as the fingers
+curl, since a fist cannot fan. And the thumb's base is built from two interpolated directions —
+where the metacarpal points, and where flexing it takes the tip — rather than from angles about the
+palm's axes: opposition is a rotation about no axis the palm has, and expressing it as Euler angles
+makes a curling opposed thumb swing away from the fingers instead of towards them, which is what
+stops it ever being able to pinch.
+
+Curling the ring and little fingers also cups the palm at their carpometacarpal joints, which a
+flat palm cannot fake.
+
+Unit tests assert the geometry against the numbers the **server's** gesture recognition uses
+(`hand_gestures.rs` plus the defaults in `HandTrackingInteractionConfig`): that Pinch really does
+bring the fingertips within its click distance, that Grasp curls every finger inside the curl
+distance while Point keeps the index out of it, and that the two hands are exact mirrors.
+
+### Gestures and settings
+
+`hands.json` next to the executable is created on first run and can be edited freely. It holds:
+
+- `rotation_sensitivity` — radians of palm rotation per pixel of drag, as the controllers have.
+- `left_start_position` / `right_start_position`, `start_pitch_degrees`, `start_roll_degrees` —
+  the resting palm pose. The two hands roll inwards by the same angle in opposite directions.
+- `hand_length` — wrist joint to middle fingertip, in metres. Scales the whole skeleton, so the
+  gesture distances the server measures scale with it.
+- `transition_seconds` — how long a change of pose takes, unless the pose overrides it.
+- `model_color` — what the hand model is tinted with. A hand model usually carries no material, so
+  without this it would draw plain white; set it to `[1, 1, 1]` for a model that is textured.
+- `glove_color` — the model the fetch script downloads is a *fingerless glove*, with a modelled
+  cuff ridge at the second knuckle. Drawn in one colour that ridge reads as an unexplained seam
+  across every finger, so the glove is tinted separately from the bare fingertips; the blend
+  follows the skin weights, so the seam lands on the ridge. Set it to `null` for a plain hand
+  model, which then draws entirely in `model_color`.
+- `left_model` / `right_model` — glTF hand models, relative to the executable's directory.
+- `joint_names` — maps a rig's own bone names onto the canonical joint names, for a model whose
+  names are not recognisable. Rarely needed; see below.
+- `poses` — the selectable articulations, each with a `name`, a `description` for the tooltip, the
+  seven articulation fields (all defaulting to 0), and optionally `transition_seconds`. Idle,
+  Grasp, Point and Pinch are provided.
+- `gestures` — the timed sequences, described above.
+
+Add as many of either as you like; the grids grow to fit. A settings file this cannot parse — one
+written before the poses and gestures were separated, for instance — is moved aside to
+`hands.json.old` and replaced with fresh defaults, rather than leaving you with built-in settings
+that no edit can change.
+
+### Hand models
+
+The models are downloaded rather than committed, so this repository carries no third-party art:
+
+```sh
+python alvr/client_emulator/tools/fetch_hand_model.py
+```
+
+That fetches a left and a right hand from [Godot XR
+Tools](https://github.com/GodotVR/godot-xr-tools) into `target/debug/models/`, where `hands.json`
+looks for them. The glTF files declare themselves CC0 Public Domain in their own `asset.copyright`
+(the surrounding project is MIT licensed), and they suit this exactly: one skinned mesh each,
+rigged to twenty-six joints named after the same OpenXR layout ALVR carries. The script pins the
+upstream commit and checks a SHA-256, so a rebuild fetches the same art.
+
+Nothing depends on those particular files. Any rigged, skinned glTF hand works: joints are matched
+by name, ignoring case, separators and a trailing `_L` / `_R`, and `joint_names` covers a rig whose
+names are unrecognisable. Bones with no counterpart — a forearm, a decorative bone — ride along on
+their parent using the offset they had in the bind pose.
+
+**Rig conventions are worked out rather than assumed.** The model that ships here runs each bone
+along its own +Y, a Blender armature default, while OpenXR joints run along -Z, and its bind pose
+is a slightly relaxed hand rather than a flat one. So both skeletons are reduced to the same purely
+geometric frame — bone along -Z, back of the hand along +Y — and the constant rotation between a
+rig's own bone frame and that one is measured once from its bind pose.
+
+Joints then take their **rotation** from the emulated skeleton and their **position** from the
+model's own bind pose, with only the root pinned and the whole model uniformly scaled to
+`hand_length`. Pinning every joint to the emulated positions instead — so that the drawn hand is
+exactly the hand being sent — is the obvious thing to do and looks wrong: no two hands have the
+same proportions, and against this model the emulator's phalanges run 0.84x to 1.16x of the
+model's, alternating along each finger, so pinning squashes one segment while stretching the next
+and a straight finger comes out visibly wavy. Keeping the model's proportions costs a few
+millimetres between the drawn fingertip and the transmitted one, and the joint *angles* — which
+are what a pose is — are exact either way.
+
+The models are shaded from their normals rather than drawn unlit like the scene, because a hand
+model carries no baked lighting and a flat fetch would draw it as a silhouette with no readable
+curl.
+
+### Pointing and clicking
+
+Two things about hand tracking in SteamVR are the server's doing rather than the emulator's, and
+both surprise people.
+
+**The ray does not run along the index finger by default.** SteamVR points from the device pose,
+and ALVR builds that from the palm joint plus `left_hand_tracking_rotation_offset` (default
+`[0, -45, -90]` degrees) and `left_hand_tracking_position_offset` (default `[0.04, -0.02, -0.13]`
+m, both mirrored for the right hand). Those exist to present a hand-tracked hand as a *held
+controller*, so the ray leaves 45° off the fingers from a point 13 cm ahead of the palm.
+
+That is the server's doing, not the emulator's, and it was measured rather than assumed: with the
+head and the palm both at identity, the device orientation SteamVR reports is *bit for bit* the
+rotation offset — 0.0° of error — so the emulator is sending the palm exactly where ALVR expects
+it. The palm is the OpenXR specification's: "at the center of the middle finger's metacarpal bone",
+"+Z parallel to the middle finger's metacarpal bone, pointing away from the finger tips", "+Y ...
+pointing towards the back of the hand", which a unit test asserts.
+
+To point along the index finger instead, change both offsets:
+
+| Setting | Default | For a finger ray |
+|---|---|---|
+| `left_hand_tracking_rotation_offset` | `[0, -45, -90]` | `[0, -10, -90]` |
+| `left_hand_tracking_position_offset` | `[0.04, -0.02, -0.13]` | `[0, 0.016, -0.036]` |
+
+Measured: 34.5° between the ray and the emulated index finger before, **1.0°** after. Only the
+middle value of the rotation steers the ray, within the plane of the palm; `0` would aim along the
+middle finger. The position puts the ray's origin at the index *knuckle* rather than the
+fingertip, deliberately — the offset is a constant applied to the palm, so an origin placed at the
+fingertip in one pose detaches from it in every other, while the knuckle barely moves as the
+fingers curl.
+
+**Clicking needs one switch.** `headset.controllers.hand_tracking_interaction` is **off by
+default**, and while it is off no hand gesture produces any button at all, so nothing can be
+clicked at any distance. Turn it on and the server derives buttons from the joints it is being
+sent, on both the controller and the hand-tracking device:
+
+| Gesture | Left | Right |
+|---|---|---|
+| Thumb + index pinch | `trigger/value`, and `trigger/click` | the same |
+| Thumb + middle pinch | `y/click` | `b/click` |
+| Thumb + ring pinch | `x/click` | `a/click` |
+| Thumb + little pinch | `menu/click` | — |
+| Curling the last three fingers | `squeeze/value`, and `squeeze/click` | the same |
+| Curling the thumb | `thumbstick/click` | the same |
+| The thumb over the index finger | `thumbstick/x`, `thumbstick/y` | the same |
+
+So the built-in **Pinch** pose is a trigger pull and **Grasp** is a grip squeeze, and the **Click**
+gesture is a whole press-and-release — which is the right
+model to emulate: a pinch is the select gesture on Quest and in OpenXR's own
+`XR_EXT_hand_interaction`. (The air tap that moves the index finger down and up instead is
+HoloLens'; nothing in this path uses it.) Their poses are built to land inside the recognition's
+default distances, which the unit tests assert against the same numbers `hand_gestures.rs` uses.
+
+> **A pinch does not click, and it is a driver limitation rather than anything the emulator can
+> send.** With `hand_skeleton.steamvr_input_2_0` on — the default — the hands are presented as
+> *separate hand-tracking devices*, and `props.rs` gives those devices SteamVR's
+> `svl_hand_interaction_augmented` input profile. That profile declares `/input/index_pinch`,
+> `/input/grip`, `/input/system`, `/input/index_point` and the skeleton; it has **no
+> `/input/trigger`**. Meanwhile `register_buttons` maps the tracker back to the hand id and creates
+> the *emulated controller's* components on it (`trigger/value`, `x/click`, ...), and the string
+> `index_pinch` appears nowhere in ALVR's source. Applications bind against the advertised profile,
+> so they wait on inputs nothing ever sets: the pose and the skeleton work, and no button ever
+> does.
+>
+> **Turning `steamvr_input_2_0` off is not a good workaround**, though it does make clicking work.
+> The hands then ride on the ordinary controller device, which brings the whole controller
+> presentation with it: SteamVR shows controller icons and draws controller models, the pointer
+> comes from the oculus_touch profile's own tip pose rather than from the palm — so the finger
+> alignment above is undone — and applications request the skeleton in its "with controller" range,
+> which curls the fingers around a controller that is not there. It also needs a SteamVR restart
+> each way, since the option is `steamvr-restart` flagged.
+>
+> The fix belongs in the driver: either set the profile's own inputs on the hand-tracking devices
+> (`/input/index_pinch` from the thumb-index pinch gesture, `/input/grip` from the grip curl), or
+> stop advertising a profile whose inputs are never driven. Until then, hand emulation gives
+> correct poses, skeletons and gestures, and no clicks.
+>
+> (The server log also shows `Received button not mapped: .../trigger/click`. That one is a red
+> herring: when a gesture source has a value but no click, `automatic_bindings` derives the click
+> from the value with a threshold, so that path is fine.)
+
+### Server settings
+
+Hand tracking reaches SteamVR through settings that are on by default, but worth knowing:
+
+| Setting | Effect |
+|---|---|
+| `headset.controllers.hand_skeleton` | Must be enabled, or the skeleton is dropped before the driver. `steamvr_input_2_0` puts the hands on separate hand-tracking devices rather than on the controller devices — **turn it off if you want gestures to click**; see above |
+| `headset.controllers.tracked` | Must be true, as for controllers |
+| `headset.controllers.hand_tracking_interaction` | **Off by default.** Turn it on to have the server derive controller buttons from the gestures — pinches, curls, a joystick from the index finger. The gesture poses here are built to land inside its default thresholds |
+| `left_hand_tracking_position_offset` / `rotation_offset` | The server offsets the SteamVR device pose from the palm by these (default `[0.04, -0.02, -0.13]` and `[0, -45, -90]`, mirrored for the right hand), so the device pose sits where a controller grip would. Real hand tracking gets the same treatment; the emulator does not compensate for it |
 
 ## HTTP API
 
@@ -390,6 +651,98 @@ curl -X POST http://127.0.0.1:8080/api/controllers/right/inputs/click \
 Returns the pose and all inputs to their defaults. Emulation stays enabled and the profile
 selection is kept.
 
+### `GET /api/hands`
+
+Both hands' full state, plus the available gestures:
+
+```json
+{
+  "poses":    [{ "name": "Idle",  "description": "Relaxed open hand, ..." }, ...],
+  "gestures": [{ "name": "Click", "description": "Pinch and release ..." }, ...],
+  "left": {
+    "enabled": true,
+    "visible": true,
+    "position": [-0.18, -0.25, -0.35],
+    "orientation": [0.172, 0.023, -0.129, 0.976],
+    "pose": "Pinch",
+    "gesture": null,
+    "articulation": {
+      "thumb": 0.45, "index": 0.52, "middle": 0.95, "ring": 1.0, "little": 1.0,
+      "spread": 0.0, "thumb_opposition": 0.72
+    },
+    "moving": false
+  },
+  "right": { ... }
+}
+```
+
+`position` and `orientation` are the head-relative palm pose, same axes as the controllers.
+`articulation` is what is being sent *right now*, so mid-movement it is between two poses. `pose`
+is `null` when the articulation was set directly rather than picked; `gesture` names the sequence
+playing, if any; `moving` is true while either is still running.
+
+### `POST /api/hands/{left|right}`
+
+Enables the hand and shows its model. Every field is optional. Enabling a hand disables that side's
+controller, as the toolbar toggles do:
+
+```sh
+curl -X POST http://127.0.0.1:8080/api/hands/left \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true, "visible": true}'
+```
+
+### `POST /api/hands/{left|right}/pose`
+
+Sets the head-relative palm pose. Both fields optional; the quaternion is normalised on apply:
+
+```sh
+curl -X POST http://127.0.0.1:8080/api/hands/left/pose \
+  -H "Content-Type: application/json" \
+  -d '{"position": [-0.1, -0.05, -0.4], "orientation": [0.38, 0.0, 0.0, 0.92]}'
+```
+
+### `POST /api/hands/{left|right}/articulation`
+
+Moves the hand into a named pose, into an articulation given outright, or into a pose with some
+fields overridden. `transition_seconds` overrides the configured time; `0` applies immediately,
+which is what a scripted test usually wants:
+
+```sh
+curl -X POST http://127.0.0.1:8080/api/hands/right/articulation \
+  -H "Content-Type: application/json" \
+  -d '{"pose": "Pinch"}'
+
+curl -X POST http://127.0.0.1:8080/api/hands/right/articulation \
+  -H "Content-Type: application/json" \
+  -d '{"pose": "Grasp", "little": 0.0, "transition_seconds": 0}'
+
+curl -X POST http://127.0.0.1:8080/api/hands/left/articulation \
+  -H "Content-Type: application/json" \
+  -d '{"index": 1.0, "spread": 0.5}'
+```
+
+Unknown pose names are rejected with a 400 listing what is available. Articulation fields given
+without a pose modify what the hand is currently holding.
+
+### `POST /api/hands/{left|right}/gesture`
+
+Plays a timed gesture from its beginning, restarting it if it is already running:
+
+```sh
+curl -X POST http://127.0.0.1:8080/api/hands/left/gesture \
+  -H "Content-Type: application/json" \
+  -d '{"gesture": "Click"}'
+```
+
+`GET /api/hands` reports it as `gesture` while it runs, with `moving` true, and the hand is left
+holding whatever pose the sequence ended on.
+
+### `POST /api/hands/{left|right}/reset`
+
+Returns the palm pose and the articulation to their defaults and stops any gesture. Emulation stays
+enabled.
+
 ## Notes and limitations
 
 - **Shared client identity.** `alvr_client_core` stores its hostname in a per-user config file
@@ -411,6 +764,10 @@ selection is kept.
   views instead, which is what the generator script does.
 - Only triangle-mode primitives are drawn; point and line modes are skipped with a warning.
 - Back-face culling is disabled, since room scans are frequently inconsistently wound.
+- **Hand models are loaded once**, when a hand's model is first shown. Editing `hands.json` to
+  point at a different one takes a restart, unlike a controller profile change.
+- A hand model may have at most 64 skin joints; beyond that the extras are not posed. A hand has
+  26.
 
 ## Layout
 
@@ -419,14 +776,20 @@ selection is kept.
 | `src/main.rs` | eframe app, toolbar, input handling, API request servicing |
 | `src/camera.rs` | First person camera and eye/projection matrices |
 | `src/scene.rs` | glTF loading into a plain geometry container |
-| `src/render.rs` | wgpu pipeline, on-screen views, offscreen capture, controller models |
-| `src/client.rs` | `ClientCoreContext` lifecycle, tracking thread, button sync |
+| `src/skinned.rs` | Skinned glTF loading and retargeting an arbitrary hand rig onto the joints |
+| `src/render.rs` | wgpu pipelines, on-screen views, offscreen capture, controller and hand models |
+| `src/client.rs` | `ClientCoreContext` lifecycle, tracking thread, button and skeleton sync |
 | `src/controllers.rs` | Controller state, profiles and the settings file |
-| `src/controller_ui.rs` | Controller icons, movement panel and the corner input panels |
+| `src/hands.rs` | Hand articulation model, skeleton synthesis, gestures and the settings file |
+| `src/overlay.rs` | Device icons over the view and the 6DoF movement panel, shared by both kinds |
+| `src/controller_ui.rs` | Controller toolbar section and the corner input panels |
+| `src/hand_ui.rs` | Hand toolbar section and the corner gesture panels |
 | `src/api.rs` | HTTP server and shared state |
 | `src/shader.wgsl` | Unlit vertex/fragment shader |
+| `src/hand.wgsl` | Skinned, normal-shaded hand shader |
 | `tools/make_environment.py` | Generates a test environment |
 | `tools/convert_rendermodel.py` | Converts a local SteamVR render model into a loadable glTF |
+| `tools/fetch_hand_model.py` | Downloads the CC0 hand models the hand renderer draws |
 
 `Scene` is deliberately a geometry container rather than a renderer, so an alternative source such as
 a Gaussian splat capture can be added without changing the code that consumes it.

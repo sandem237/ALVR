@@ -1,5 +1,6 @@
-//! Controller emulation UI: the toolbar row, the icons projected over the 3D view, the pose
-//! movement panel, and the skeuomorphic controller panels in the bottom corners.
+//! Controller emulation UI: the toolbar row and the skeuomorphic controller panels in the bottom
+//! corners. The icons over the 3D view and the 6DoF movement panel are shared with hand emulation
+//! and live in [`crate::overlay`].
 //!
 //! Mouse interactions follow one rule: inputs driven by a held mouse button spring back to rest
 //! when the button is released, like their physical counterparts, while right-click toggles
@@ -8,36 +9,25 @@
 //! values set through the API are never overwritten by mere mouse hovering.
 
 use crate::{
-    camera::Camera,
     client::HapticsEvent,
     controllers::{ControllerSettings, ControllerState, Hand, Profile},
+    overlay::{hand_color, input_tooltip},
 };
-use alvr_common::glam::{EulerRot, Mat4, Quat, Vec3};
 use alvr_packets::ButtonValue;
 use eframe::egui::{
-    Align2, Color32, ComboBox, Context, CornerRadius, FontId, Id, Order, PointerButton, Pos2,
-    Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
+    Align2, Color32, ComboBox, Context, CornerRadius, FontId, Id, Order, PointerButton, Pos2, Rect,
+    Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
-/// The pointer opens a controller's movement panel within this distance of its icon.
-const ICON_HOVER_RADIUS: f32 = 56.0;
-
-/// Icons keep this distance from the view edge when clamped.
-const EDGE_MARGIN: f32 = 18.0;
-
 /// Scalar change per pixel of right-button drag on triggers, grips and force pads.
 const PULL_PER_PIXEL: f32 = 1.0 / 120.0;
 
 /// A haptics pulse shorter than this is stretched so it remains visible.
 const MIN_HAPTICS_DISPLAY: Duration = Duration::from_millis(150);
-
-/// Approximate outer size of the movement panel: four cells plus spacing and the popup frame.
-/// Used to centre it under the icon, since the area's own size is not known up front.
-const MOVE_PANEL_SIZE: Vec2 = vec2(4.0 * 54.0 + 3.0 * 8.0 + 14.0, 66.0 + 14.0);
 
 // Skeuomorphic panel geometry, following the layout in the design document: trigger on top, the
 // thumbstick (or trackpad) with the face buttons in the middle, menu / system / thumbrest along
@@ -174,14 +164,6 @@ impl PanelFeatures {
 pub struct ControllerUi {
     /// Inputs the mouse drove last frame, so ending an interaction releases them exactly once.
     driven: [HashSet<&'static str>; 2],
-    /// Movement panel position, kept while hovered and frozen while dragged.
-    panel_pos: [Option<Pos2>; 2],
-    /// Screen rect the panel occupied last frame, for hover hysteresis.
-    panel_rect: [Option<Rect>; 2],
-    /// Metres of controller movement per pixel of drag, captured when the panel opens.
-    panel_scale: [f32; 2],
-    /// Whether a panel cell is being dragged, which freezes the panel in place.
-    panel_dragging: [bool; 2],
     haptics: [HapticsViz; 2],
 }
 
@@ -196,10 +178,6 @@ impl ControllerUi {
     pub fn new() -> Self {
         Self {
             driven: [HashSet::new(), HashSet::new()],
-            panel_pos: [None, None],
-            panel_rect: [None, None],
-            panel_scale: [0.001; 2],
-            panel_dragging: [false; 2],
             haptics: [HapticsViz::default(), HapticsViz::default()],
         }
     }
@@ -215,203 +193,6 @@ impl ControllerUi {
                 };
             }
         }
-    }
-
-    /// Draws the controller icons over the 3D view and runs the pose movement panels.
-    ///
-    /// `views` lists the sub-rectangles the view is split into, with the projection aspect ratio
-    /// and eye view matrix mapping world space onto each (the live camera's over the scene, the
-    /// displayed frame's over the letterboxed video). `head` is the pose the controllers' local
-    /// poses are composed with, from the same source as the views. `interactive` is false while
-    /// the mouse drives the camera, in which case only the icons are drawn.
-    pub fn view_overlays(
-        &mut self,
-        ctx: &Context,
-        views: &[(Rect, f32, Mat4)],
-        head: (Vec3, Quat),
-        controllers: &mut [ControllerState; 2],
-        settings: &ControllerSettings,
-        interactive: bool,
-    ) {
-        let pointer = ctx.input(|state| state.pointer.latest_pos());
-        let painter = ctx.layer_painter(eframe::egui::LayerId::new(
-            Order::Middle,
-            Id::new("controller icons"),
-        ));
-
-        // Approaching an icon opens the movement panel only when nothing floats above the view at
-        // the pointer — hovering the corner input panels must not pop movement panels open.
-        let pointer_unobstructed = pointer.is_some_and(|pos| {
-            ctx.layer_id_at(pos)
-                .is_none_or(|layer| layer.order == Order::Background)
-        });
-
-        for hand in Hand::BOTH {
-            let index = hand.index();
-            let state = &mut controllers[index];
-
-            if !state.enabled {
-                self.panel_pos[index] = None;
-                self.panel_dragging[index] = false;
-                continue;
-            }
-
-            let world = head.0 + head.1 * state.position;
-
-            let mut hover_anchor = None;
-
-            for (rect, projection_aspect, view) in views {
-                let projected = project_to_view(*view, *rect, *projection_aspect, world);
-                draw_icon(&painter, hand, &projected);
-
-                // Edge-clamped icons open the panel too — that is how an off-screen controller is
-                // brought back into view.
-                if interactive
-                    && pointer_unobstructed
-                    && let Some(pointer) = pointer
-                    && pointer.distance(projected.pos) < ICON_HOVER_RADIUS
-                {
-                    hover_anchor = Some((projected.pos, projected.depth, rect.height()));
-                }
-            }
-
-            // The panel stays put while one of its cells is dragged, follows the icon while
-            // hovered, and lingers while the pointer is over the panel itself.
-            if !self.panel_dragging[index] {
-                if let Some((anchor, depth, view_height)) = hover_anchor {
-                    self.panel_pos[index] = Some(anchor);
-                    // A floor on the depth keeps drags usable when the controller is behind the
-                    // camera or very close, where the true pixel size would collapse to nothing.
-                    self.panel_scale[index] = metres_per_pixel(depth.max(0.3), view_height);
-                } else {
-                    let over_panel = match (pointer, self.panel_rect[index]) {
-                        (Some(pointer), Some(rect)) => rect.expand(12.0).contains(pointer),
-                        _ => false,
-                    };
-
-                    if !over_panel {
-                        self.panel_pos[index] = None;
-                    }
-                }
-            }
-
-            if !interactive {
-                self.panel_pos[index] = None;
-                self.panel_dragging[index] = false;
-            }
-
-            if let Some(anchor) = self.panel_pos[index] {
-                self.movement_panel(ctx, hand, anchor, state, settings);
-            } else {
-                self.panel_rect[index] = None;
-            }
-        }
-    }
-
-    /// The four drag pads that move and rotate one controller.
-    fn movement_panel(
-        &mut self,
-        ctx: &Context,
-        hand: Hand,
-        anchor: Pos2,
-        state: &mut ControllerState,
-        settings: &ControllerSettings,
-    ) {
-        let index = hand.index();
-        let scale = self.panel_scale[index];
-        let sensitivity = settings.rotation_sensitivity;
-
-        let mut dragging = false;
-
-        // Positioned explicitly rather than with `pivot`, which places the area by its remembered
-        // size and misplaces it while that size is unknown. Clamped fully on screen so the panel
-        // stays reachable when the icon sits at a view edge.
-        let screen = ctx.content_rect();
-        let position = pos2(
-            (anchor.x - MOVE_PANEL_SIZE.x / 2.0)
-                .clamp(screen.left() + 8.0, screen.right() - MOVE_PANEL_SIZE.x - 8.0),
-            (anchor.y + 20.0).min(screen.bottom() - MOVE_PANEL_SIZE.y - 8.0),
-        );
-
-        let area = eframe::egui::Area::new(Id::new(("controller move panel", index)))
-            .fixed_pos(position)
-            .order(Order::Foreground)
-            .show(ctx, |ui| {
-                eframe::egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let cell = |ui: &mut Ui, glyph: CellGlyph, label: &str| {
-                            drag_cell(ui, hand, glyph, label)
-                        };
-
-                        let response = cell(ui, CellGlyph::Planar, "Move");
-                        if response.dragged_by(PointerButton::Primary) {
-                            let delta = response.drag_delta();
-                            state.position.x += delta.x * scale;
-                            state.position.y -= delta.y * scale;
-                            dragging = true;
-                        }
-                        input_tooltip(
-                            response,
-                            "Move",
-                            "Drag to move the controller on the vertical plane facing the head",
-                        );
-
-                        let response = cell(ui, CellGlyph::Depth, "Depth");
-                        if response.dragged_by(PointerButton::Primary) {
-                            // Dragging up pushes the controller away from the head (-Z forward).
-                            state.position.z += response.drag_delta().y * scale;
-                            dragging = true;
-                        }
-                        input_tooltip(
-                            response,
-                            "Depth",
-                            "Drag up or down to move the controller away from or towards the head",
-                        );
-
-                        let response = cell(ui, CellGlyph::Roll, "Roll");
-                        if response.dragged_by(PointerButton::Primary) {
-                            let angle = -response.drag_delta().x * sensitivity;
-                            // Roll turns the controller around its own forward axis.
-                            state.orientation =
-                                (state.orientation * Quat::from_rotation_z(angle)).normalize();
-                            dragging = true;
-                        }
-                        input_tooltip(
-                            response,
-                            "Roll",
-                            "Drag sideways to roll the controller around its forward axis",
-                        );
-
-                        let response = cell(ui, CellGlyph::Aim, "Aim");
-                        if response.dragged_by(PointerButton::Primary) {
-                            let delta = response.drag_delta();
-
-                            // Adjust yaw and pitch as absolute angles with the roll preserved.
-                            // Incremental head-axis rotations look the same per stroke, but they
-                            // do not commute, so alternating strokes gradually rolled the
-                            // controller — roll belongs to the roll pad alone. The pitch clamp
-                            // keeps the decomposition away from the gimbal poles.
-                            let (yaw, pitch, roll) =
-                                state.orientation.to_euler(EulerRot::YXZ);
-
-                            let limit = std::f32::consts::FRAC_PI_2 - 0.01;
-                            let yaw = yaw - delta.x * sensitivity;
-                            let pitch = (pitch - delta.y * sensitivity).clamp(-limit, limit);
-
-                            state.orientation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, roll);
-                            dragging = true;
-                        }
-                        input_tooltip(
-                            response,
-                            "Aim",
-                            "Drag to aim the controller: yaw and pitch around the head axes",
-                        );
-                    });
-                });
-            });
-
-        self.panel_rect[index] = Some(area.response.rect);
-        self.panel_dragging[index] = dragging;
     }
 
     /// Draws the skeuomorphic controller panels in the bottom corners and applies their input.
@@ -508,249 +289,80 @@ struct PanelChanges {
     toggles: Vec<(&'static str, ButtonValue)>,
 }
 
-/// The second toolbar row: enable toggles, profile selection, model display and reset.
+/// The controller section of the inputs toolbar row: enable toggles, profile selection, model
+/// display and reset. Added to the caller's layout, which is what puts it beside the hand section.
+///
+/// `hands_enabled` is the matching flag of the hand on each side. A controller and a hand cannot
+/// be emulated on the same side — a real headset reports one or the other — so switching a
+/// controller on switches its hand off. Switching it off deliberately does not bring the hand
+/// back: that would make the toggle mean two different things depending on history.
 pub fn toolbar_row(
     ui: &mut Ui,
     controllers: &mut [ControllerState; 2],
+    hands_enabled: &mut [bool; 2],
     settings: &ControllerSettings,
 ) {
-    ui.horizontal(|ui| {
-        ui.label("Inputs:");
+    ui.label("Controller:");
 
-        ui.separator();
-
-        ui.label("Controller:");
-
-        for hand in Hand::BOTH {
-            let label = match hand {
-                Hand::Left => "L",
-                Hand::Right => "R",
-            };
-            ui.toggle_value(&mut controllers[hand.index()].enabled, label);
-        }
-
-        // One selector for both hands; the API can still set them individually, in which case the
-        // selector shows the mix until it is used again.
-        let same_profile = controllers[0].profile_index == controllers[1].profile_index;
-        let selected_text = if same_profile {
-            settings
-                .profiles
-                .get(controllers[0].profile_index)
-                .map(|profile| profile.name.clone())
-                .unwrap_or_else(|| "?".into())
-        } else {
-            "Mixed".into()
+    for hand in Hand::BOTH {
+        let index = hand.index();
+        let label = match hand {
+            Hand::Left => "L",
+            Hand::Right => "R",
         };
 
-        ComboBox::from_id_salt("controller profile")
-            .selected_text(selected_text)
-            .show_ui(ui, |ui| {
-                for (index, profile) in settings.profiles.iter().enumerate() {
-                    let selected = same_profile && index == controllers[0].profile_index;
-                    if ui.selectable_label(selected, &profile.name).clicked() {
-                        for state in controllers.iter_mut() {
-                            if state.profile_index != index {
-                                state.profile_index = index;
-                                // Held inputs of the previous type would linger stale.
-                                state.inputs.clear();
-                            }
+        if ui
+            .toggle_value(&mut controllers[index].enabled, label)
+            .changed()
+            && controllers[index].enabled
+        {
+            hands_enabled[index] = false;
+        }
+    }
+
+    // One selector for both hands; the API can still set them individually, in which case the
+    // selector shows the mix until it is used again.
+    let same_profile = controllers[0].profile_index == controllers[1].profile_index;
+    let selected_text = if same_profile {
+        settings
+            .profiles
+            .get(controllers[0].profile_index)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "?".into())
+    } else {
+        "Mixed".into()
+    };
+
+    ComboBox::from_id_salt("controller profile")
+        .width(96.0)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            for (index, profile) in settings.profiles.iter().enumerate() {
+                let selected = same_profile && index == controllers[0].profile_index;
+                if ui.selectable_label(selected, &profile.name).clicked() {
+                    for state in controllers.iter_mut() {
+                        if state.profile_index != index {
+                            state.profile_index = index;
+                            // Held inputs of the previous type would linger stale.
+                            state.inputs.clear();
                         }
                     }
                 }
-            });
-
-        let mut visible = controllers.iter().all(|state| state.model_visible);
-        if ui.toggle_value(&mut visible, "Display").changed() {
-            for state in controllers.iter_mut() {
-                state.model_visible = visible;
             }
-        }
+        });
 
-        if ui.button("Reset").clicked() {
-            for hand in Hand::BOTH {
-                controllers[hand.index()].reset(settings, hand);
-            }
-        }
-
-        // Right aligned, matching the hint on the row above.
-        if controllers.iter().any(|state| state.enabled) {
-            ui.with_layout(
-                eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
-                |ui| {
-                    ui.label(
-                        eframe::egui::RichText::new(
-                            "Hover a controller icon to move it; use the corner panels for buttons",
-                        )
-                        .weak(),
-                    );
-                },
-            );
-        }
-    });
-}
-
-/// A controller icon projected into one view.
-struct ProjectedIcon {
-    pos: Pos2,
-    /// True when the controller is outside the view and the icon sits on the edge.
-    clamped: bool,
-    /// Direction from the icon towards the controller, when clamped.
-    outward: Vec2,
-    /// View-space distance, used to scale drags from pixels to metres.
-    depth: f32,
-}
-
-/// Projects a world position into a view rectangle, clamping to the edge when off screen.
-///
-/// `projection_aspect` is the aspect ratio of the projection that produced the rectangle's
-/// content, which over the letterboxed video differs from the rectangle's own shape.
-fn project_to_view(view: Mat4, rect: Rect, projection_aspect: f32, world: Vec3) -> ProjectedIcon {
-    let inner = rect.shrink(EDGE_MARGIN);
-    let view_pos = view.transform_point3(world);
-    let depth = -view_pos.z;
-
-    // Behind the camera there is no projection; point from the view centre towards where the
-    // controller lies.
-    if depth < 0.05 {
-        let mut outward = vec2(view_pos.x, -view_pos.y);
-        if outward == Vec2::ZERO {
-            outward = vec2(0.0, 1.0);
-        }
-        let outward = outward.normalized();
-
-        // Walk to the edge of the view in that direction.
-        let pos = inner.clamp(rect.center() + outward * rect.size().length());
-
-        return ProjectedIcon {
-            pos,
-            clamped: true,
-            outward,
-            depth: 0.05,
-        };
-    }
-
-    let ndc = Camera::projection_matrix(projection_aspect).project_point3(view_pos);
-
-    let pos = pos2(
-        rect.left() + (ndc.x + 1.0) / 2.0 * rect.width(),
-        rect.top() + (1.0 - ndc.y) / 2.0 * rect.height(),
-    );
-
-    if inner.contains(pos) {
-        ProjectedIcon {
-            pos,
-            clamped: false,
-            outward: Vec2::ZERO,
-            depth,
-        }
-    } else {
-        let clamped = inner.clamp(pos);
-        ProjectedIcon {
-            pos: clamped,
-            clamped: true,
-            outward: (pos - clamped).normalized(),
-            depth,
-        }
-    }
-}
-
-fn hand_color(hand: Hand) -> Color32 {
-    match hand {
-        Hand::Left => Color32::from_rgb(96, 160, 255),
-        Hand::Right => Color32::from_rgb(255, 150, 60),
-    }
-}
-
-fn draw_icon(painter: &eframe::egui::Painter, hand: Hand, icon: &ProjectedIcon) {
-    let color = hand_color(hand);
-
-    painter.circle_filled(icon.pos, 11.0, color.gamma_multiply(0.8));
-    painter.circle_stroke(icon.pos, 11.0, Stroke::new(1.5, Color32::WHITE.gamma_multiply(0.7)));
-    painter.text(
-        icon.pos,
-        Align2::CENTER_CENTER,
-        match hand {
-            Hand::Left => "L",
-            Hand::Right => "R",
-        },
-        FontId::proportional(13.0),
-        Color32::BLACK,
-    );
-
-    if icon.clamped {
-        painter.arrow(
-            icon.pos + icon.outward * 13.0,
-            icon.outward * 9.0,
-            Stroke::new(2.0, color),
-        );
-    }
-}
-
-/// Metres a controller moves per pixel of drag: the size of one pixel at the controller's depth.
-fn metres_per_pixel(depth: f32, view_height: f32) -> f32 {
-    2.0 * depth.max(0.1) * Camera::fov().up.tan() / view_height.max(1.0)
-}
-
-enum CellGlyph {
-    Planar,
-    Depth,
-    Roll,
-    Aim,
-}
-
-/// One drag pad of the movement panel: a square drag surface with a glyph and a caption.
-fn drag_cell(ui: &mut Ui, hand: Hand, glyph: CellGlyph, label: &str) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(54.0, 66.0), Sense::drag());
-    let visuals = ui.style().interact(&response);
-    let painter = ui.painter();
-
-    let pad = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y - 15.0));
-    painter.rect_filled(pad, CornerRadius::same(4), visuals.bg_fill);
-    painter.rect_stroke(pad, CornerRadius::same(4), visuals.bg_stroke, StrokeKind::Inside);
-
-    let color = if response.dragged() {
-        hand_color(hand)
-    } else {
-        visuals.text_color()
-    };
-    let stroke = Stroke::new(1.5, color);
-    let center = pad.center();
-
-    match glyph {
-        CellGlyph::Planar => {
-            for direction in [vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0)] {
-                painter.arrow(center + direction * 4.0, direction * 12.0, stroke);
-            }
-        }
-        CellGlyph::Depth => {
-            painter.arrow(center + vec2(0.0, -3.0), vec2(0.0, -13.0), stroke);
-            painter.arrow(center + vec2(0.0, 3.0), vec2(0.0, 13.0), stroke);
-            painter.line_segment(
-                [center + vec2(-10.0, 0.0), center + vec2(10.0, 0.0)],
-                Stroke::new(1.0, color.gamma_multiply(0.5)),
-            );
-        }
-        CellGlyph::Roll => {
-            painter.circle_stroke(center, 10.0, stroke);
-            painter.arrow(center + vec2(10.0, -2.0), vec2(0.0, 8.0), stroke);
-        }
-        CellGlyph::Aim => {
-            painter.circle_stroke(center, 5.0, stroke);
-            for direction in [vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0)] {
-                painter.arrow(center + direction * 8.0, direction * 8.0, stroke);
-            }
+    let mut visible = controllers.iter().all(|state| state.model_visible);
+    if ui.toggle_value(&mut visible, "Display").changed() {
+        for state in controllers.iter_mut() {
+            state.model_visible = visible;
         }
     }
 
-    painter.text(
-        pos2(rect.center().x, rect.max.y - 7.0),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(10.0),
-        visuals.text_color(),
-    );
-
-    response
+    if ui.button("Reset").clicked() {
+        for hand in Hand::BOTH {
+            controllers[hand.index()].reset(settings, hand);
+        }
+    }
 }
 
 /// Lays out and runs one skeuomorphic controller panel.
@@ -1521,19 +1133,6 @@ fn haptic_indicator(ui: &mut Ui, hand: Hand, center: Pos2, haptics: &HapticsViz,
         "Haptic feedback",
         "Brightness shows the amplitude, blinking the frequency",
     );
-}
-
-/// Two-part input tooltip: what the control drives as a white title, the mouse actions in light
-/// grey underneath.
-fn input_tooltip(response: Response, title: impl Into<String>, actions: impl Into<String>) {
-    let title = title.into();
-    let actions = actions.into();
-
-    response.on_hover_ui(|ui| {
-        ui.label(eframe::egui::RichText::new(title).color(Color32::WHITE));
-        ui.add_space(4.0);
-        ui.label(eframe::egui::RichText::new(actions).color(Color32::from_gray(170)));
-    });
 }
 
 /// Colour of an active haptics pulse at a point in time.

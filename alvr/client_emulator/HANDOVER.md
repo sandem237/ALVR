@@ -1,8 +1,9 @@
 # ALVR client emulator — handover
 
-**Branch:** `emulator` · **Last commit:** `8f1c6a77 Fix video freeze`
-**State:** Working. Connects to a real ALVR server, streams, decodes and displays video, no freezing
-or corruption observed. Verified against SteamVR Home on Windows with an RTX 5090.
+**Branch:** `emulator` · **Last commit:** `cee3e40e Improved UI layout`
+**State:** Working. Connects to a real ALVR server, streams, decodes and displays video, emulates
+controllers and hand tracking. No freezing or corruption observed. Verified against SteamVR Home on
+Windows with an RTX 5090.
 
 Read [`README.md`](README.md) for how to build, run and use it. This file is the "why is it like
 this, and what next" companion — the reasoning and the hard-won failures that the code comments alone
@@ -42,13 +43,18 @@ These were settled deliberately; re-opening them needs a reason.
 main.rs           eframe app: toolbar, input, paint callback, services API requests
 camera.rs         first person camera, per-eye view and projection matrices
 client.rs         ClientCoreContext lifecycle, tracking thread, decoder wiring, statistics,
-                  controller motion / button / interaction-profile sync
+                  controller motion / button / interaction-profile / hand skeleton sync
 controllers.rs    emulated controller state, profiles, controllers.json settings file
-controller_ui.rs  controller icons over the view, movement panel, corner input panels
+hands.rs          hand articulation model, 26-joint skeleton synthesis, poses and timed
+                  gestures, hands.json settings file
+overlay.rs        device icons over the view and the 6DoF movement panel, shared by both kinds
+controller_ui.rs  controller toolbar section, corner input panels
+hand_ui.rs        hand toolbar section, corner pose/gesture panels, icons drawn from the poses
 decoder/          VideoDecoder trait + DecodedFrame enum; software.rs is the ffmpeg CPU implementation
 video.rs          decoded frames to GPU, YUV to RGB in video.wgsl, per-eye region sampling
-render.rs         glTF scene pipeline, controller models, on-screen views and offscreen capture
+render.rs         glTF scene pipeline, controller and skinned hand models, views and capture
 scene.rs          glTF loading into a plain geometry container
+skinned.rs        skinned glTF loading, and retargeting any hand rig onto the emulated joints
 api.rs            HTTP control server
 ```
 
@@ -136,6 +142,150 @@ Added after the freeze work; see README.md for usage. Implementation points wort
 Verified end-to-end against SteamVR Home: SteamVR renders the emulated Quest controllers at the
 emulated poses, and button presses arrive server-side (watched via the `/api/events` WebSocket with
 `log_button_presses` enabled) including the derived touch inputs and timed click releases.
+
+## Hand emulation notes
+
+Added on top of the controller work; see README.md for usage. What is worth knowing:
+
+- **A hand replaces its controller on the wire, it does not accompany it.** An enabled hand sends
+  `hand_skeletons[i]` and *no* `HAND_*_ID` device motion, which is what `client_openxr` does for a
+  freely tracked hand. The absence is load-bearing at both ends: `server_core`'s `tracking_loop`
+  runs `trigger_hand_gesture_actions` only for a hand whose device motion is missing, and
+  `Controller.cpp` derives the device pose from `handSkeleton->jointPositions[0]` only when
+  `controllerMotion` is null. Sending both is the *multimodal* case — a hand holding a controller —
+  which is not what the toggles mean. Hence the per-side exclusion in the UI and in the API.
+- **The pose model is seven numbers, not 26 rotations**, and the reason is not only usability: a
+  joint-angle representation makes most of its state space anatomically impossible, so an API
+  caller sweeping values would mostly produce non-hands. See `hands.rs`.
+- **The thumb's base frame is two directions, not three angles.** This was the one piece of the
+  geometry that had to be rebuilt. Opposition is a rotation about no axis the palm has: the
+  metacarpal swings across in front of the palm *and* the digit rolls, so that flexing it
+  afterwards carries the tip towards the fingers rather than towards the palm. Expressed as
+  `fan × swing × roll` Euler angles the two interact, and the measured result was a thumb whose tip
+  moved *further* from the index finger as opposition increased — 45 mm to 96 mm — so a pinch was
+  unreachable at any curl. Interpolating a bone direction and a "where flexing takes the tip"
+  direction, and building an orthonormal frame from the pair, gives 11 mm. The tests assert it.
+- **The unit tests are calibrated against the server, not against taste.** `hand_gestures.rs`
+  measures real distances between fingertips, adding fixed finger radii to the configured
+  thresholds. The gesture tests use those same numbers, so a change to the anatomy that would stop
+  Pinch registering as a pinch fails the build rather than being discovered in SteamVR.
+- **Rig retargeting assumes nothing about the model.** The CC0 model that ships runs bones along
+  +Y (Blender armature default) where OpenXR runs along -Z, and its bind pose is a relaxed hand,
+  not a flat one. Both skeletons are reduced to a geometric frame derived only from joint positions
+  (`hands::canonical_frames`), and the constant offset between a rig's own bone frame and that one
+  is measured from the bind pose. Two consequences worth keeping: a naive `inv(rest) * bind`
+  correction would have baked the bind pose's ~20° of curl into the flat pose, and joint
+  *positions* are taken from the transmitted skeleton rather than from the model's bone lengths, so
+  the drawn hand is the hand being sent.
+- **Joint matrices go in a uniform buffer, not a storage buffer.** Read-only storage in the vertex
+  stage is a downlevel capability that not every backend wgpu may pick offers; a fixed
+  `array<mat4x4<f32>, 64>` uniform is guaranteed everywhere and a hand needs 26. Note `glam::Mat4`
+  is not `Pod` in this workspace, so the block is packed column by column.
+- **Hands are shaded, the scene is not.** The scene assumes baked lighting; a hand model is a bare
+  mesh, and drawing it unlit produced a flat silhouette with no readable curl. One key light plus a
+  hemispheric ambient, in world space, since the skinning matrices already carry the hand's
+  transform.
+- **The icons and the movement panel are one implementation for both device kinds** (`overlay.rs`),
+  with four slots. The design called for hands to be posed identically to controllers, and two
+  copies would have drifted.
+
+### Poses against gestures
+
+A **pose** is how a hand is held — seven numbers, held indefinitely. A **gesture** is what a hand
+does — a keyframed path through those poses over a fixed duration. The split arrived after the
+first real click: holding a pinch by mouse and releasing it at the right moment is fiddly and not
+repeatable, and no amount of tuning a static pose fixes that, because the thing being emulated is a
+movement. `Point` at phase 0, `Pinch` at 0.5, `Point` at 1 over half a second is a click, and the
+button performs exactly that every time.
+
+Worth keeping in mind when reading the code: the older naming had "gesture" meaning the static
+thing, so `hands.json` written before the split will not parse. That case is handled by moving the
+file to `hands.json.old` and writing fresh defaults, which is better than the alternative of
+falling back to built-ins the user cannot then edit. The API renamed the pose selector to
+`/articulation` and gave `/gesture` to the new concept.
+
+### Found during the first real test
+
+Four of these came out of the first session actually looking at the hands, and three were the
+emulator's fault.
+
+- **The palm convention is the specification's, and that was worth checking rather than
+  asserting.** The OpenXR spec (12.30, conventions of hand joints) puts the palm joint "at the
+  center of the middle finger's metacarpal bone", with "+Z parallel to the middle finger's
+  metacarpal bone, pointing away from the finger tips" and "+Y ... perpendicular to palm surface
+  and pointing towards the back of the hand". The first implementation was right in spirit but not
+  exact — the middle metacarpal sat 3.5° off the palm's axis and the wrist 15° off its own — so the
+  constants now place the middle metacarpal *on* the palm's Z axis and the wrist directly behind
+  it, which is asserted by `palm_and_wrist_match_the_spec`. Everything downstream is tuned against
+  the real convention, so being close is not the same as being right.
+- **The SteamVR ray is 45° off the fingers, and that is correct.** The driver's device pose is
+  `palm * left_hand_tracking_rotation_offset`, whose default `[0, -45, -90]` exists to present a
+  hand-tracked hand as a *held controller*; the position offset likewise puts the device 13 cm
+  ahead of the palm. Deriving what those offsets imply about the palm frame — the offset's own
+  columns say it — is how this was settled without a headset to compare against. Only the middle
+  value steers the ray: about `-10` aims along the emulator's index finger and `0` along the
+  middle. Do not "fix" this in the emulator; it would then differ from real hardware.
+- **Nothing can be clicked until `hand_tracking_interaction` is switched on**, and it is off by
+  default. Gestures are the *only* source of buttons for a hand, and `SetButton` routes them to
+  both the controller and the hand-tracker device, so once it is on the built-in Pinch is a trigger
+  pull. Nothing to change in the emulator.
+- **Do not pin the model's joints to the transmitted positions.** The first implementation did,
+  reasoning that the drawn hand should be exactly the hand being sent. Measured against the model
+  that ships, the emulator's phalanges are 0.84x to 1.16x of the model's and the ratio *alternates*
+  along each finger, so every segment was squashed or stretched in turn and a perfectly straight
+  finger rendered with a visible S-curve that read as bending backwards. Rotations now come from
+  the emulator and positions from the model's own bind pose, anchored at the root: a few
+  millimetres of divergence at the fingertip, and no distortion. The angles, which are what a pose
+  is, were exact either way.
+- **The ray's origin is a second, separate setting.** Aligning the *direction* still left the ray
+  leaving from the middle of the palm, because that is where the palm joint is — the centre of the
+  middle metacarpal, by definition. `left_hand_tracking_position_offset` moves it; `[0, 0.016,
+  -0.036]` puts it on the index knuckle. Deliberately the knuckle and not the fingertip: the offset
+  is a constant applied to the palm, so an origin fitted to the fingertip in one pose detaches from
+  it in every other, while the knuckle hardly moves as the fingers curl.
+- **A pinch cannot click while `steamvr_input_2_0` is on, and it is a driver bug.** That option
+  routes hands to *separate hand-tracking devices*, which `props.rs` gives SteamVR's
+  `svl_hand_interaction_augmented` input profile. That profile's inputs are `index_pinch`, `grip`,
+  `system`, `index_point` and the skeleton — there is **no `/input/trigger`** — while
+  `register_buttons` deliberately maps the tracker id back to the hand id and creates the
+  *emulated controller's* components on it, and `index_pinch` appears nowhere in ALVR's source.
+  Applications bind against the advertised profile, so they wait on inputs nothing ever sets: pose
+  and skeleton work, no button ever does.
+
+  **`steamvr_input_2_0 = false` makes clicking work and is still the wrong trade** — tried, and
+  reverted. The hands then ride on the ordinary controller device and bring its whole presentation
+  with them: controller icons in the SteamVR status window, controller render models drawn under
+  the hands, a pointer taken from the oculus_touch tip pose instead of the palm (undoing the
+  finger alignment), and the skeleton requested in its "with controller" range, which curls the
+  fingers around a controller that is not there. The option is `steamvr-restart` flagged, so each
+  experiment costs a restart. The fix belongs in the driver: drive the profile's own inputs on
+  those devices, or stop advertising a profile nothing sets.
+
+  Worth recording how this was nearly misdiagnosed. The server log shows `Received button not
+  mapped: /user/hand/left/input/trigger/click`, because `get_click_bind_for_gesture` emits click
+  ids that are not in `HAND_GESTURE_BUTTON_SET`. That looks like the answer and is not:
+  `map_button_pair_automatic` derives a destination click from a source *value* through a
+  threshold whenever the source has no click of its own, so the click still arrives. Reading the
+  mapping code rather than trusting the log is what found the real cause one layer down.
+- **Pinch is the right gesture to model.** It is the select gesture on Quest and in OpenXR's
+  `XR_EXT_hand_interaction`, and it is what ALVR binds to the trigger. The air tap that flexes the
+  index finger down and up is HoloLens', and nothing in this path uses it.
+- **Icons are fitted to their cell, not just scaled.** A fixed scale keeps a fist visibly smaller
+  than an open hand, which is worth having, but anchoring on the palm ran an extended index finger
+  off the top of its cell. Each icon is now centred on the pose's own projected bounds and shrunk
+  only if it would otherwise overflow.
+- **A model can be a fingerless glove**, and drawing it in one colour makes its cuff ridge read as
+  a defect. The rim turned out to sit exactly at the second knuckle — found by profiling the bind
+  pose's cross-sectional radius along each finger — so `glove_color` tints everything up to there
+  separately, blended across the skin weights so the seam follows the modelled ridge.
+
+Verified against a running SteamVR with the emulator streaming, read back through pyopenvr:
+enabling both hands invalidates the emulated controller devices and brings up two hand-tracking
+devices (`svl_hand_interaction_augmented`), posed by the emulator; moving a hand 20 cm left, 25 cm
+up and 10 cm forward through the API moves its device by exactly that; switching a side back to a
+controller invalidates the hand device and revalidates the controller. The constant offset between
+the palm we send and the device pose SteamVR reports is the server's own
+`left_hand_tracking_position_offset`, which real hand tracking gets too.
 
 The decoder is behind a trait with a `DecoderKind::preferred()` selector so a platform-specific
 zero-copy implementation can be added later without touching the renderer. `DecodedFrame` is an enum

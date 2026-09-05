@@ -17,23 +17,33 @@ mod client;
 mod controller_ui;
 mod controllers;
 mod decoder;
+mod hand_ui;
+mod hands;
+mod overlay;
 mod render;
 mod scene;
+mod skinned;
 mod video;
 
 use crate::{
     api::{
-        CaptureRequestKind, ControllerCommand, ControllerSnapshot, ControllersResponse,
+        Articulation, CaptureRequestKind, ControllerCommand, ControllerSnapshot,
+        ControllersResponse, HandCommand, HandSnapshot, HandsResponse, NamedSummary,
         ProfileSummary, SharedState, StateResponse,
     },
     camera::{Camera, CameraInput, Eye},
     client::{
-        ClientStatus, EmulatedClient, FrameTiming, TrackedController, TrackedPose, TrackedState,
+        ClientStatus, EmulatedClient, FrameTiming, TrackedController, TrackedHand, TrackedPose,
+        TrackedState,
     },
     controller_ui::ControllerUi,
     controllers::{ControllerSettings, ControllerState, Hand},
-    render::{CaptureKind, ControllerRenderer, SceneRenderer, capture_stereo},
+    hands::{HandSettings, HandState},
+    overlay::{PoseOverlay, PoseTarget, Slot},
+    render::{CaptureKind, ControllerRenderer, DeviceModels, HandRenderer, HandTint, SceneRenderer,
+        capture_stereo},
     scene::Scene,
+    skinned::SkinnedModel,
     video::{FrameLayout, VideoRenderer},
 };
 use alvr_common::{
@@ -111,10 +121,21 @@ struct EmulatorApp {
     /// Emulated controller state, mutated by both the UI and the API commands. Left is index 0.
     controllers: [ControllerState; 2],
     controller_ui: ControllerUi,
+    hand_settings: HandSettings,
+    /// Emulated hand state, mutated by both the UI and the API commands. Left is index 0.
+    hands: [HandState; 2],
+    /// The icons and 6DoF panels of the controllers and the hands, which share one implementation.
+    pose_overlay: PoseOverlay,
     /// Pending releases queued by the API's click endpoint.
     timed_releases: Vec<TimedRelease>,
     /// Which profile's model is uploaded to the GPU per hand, to reload only on change.
     loaded_models: [Option<usize>; 2],
+    /// The loaded hand models, kept on the CPU because posing them needs their inverse bind
+    /// matrices every frame. Left is index 0.
+    hand_models: [Option<SkinnedModel>; 2],
+    /// Whether loading a hand model has been attempted, so a missing file is reported once rather
+    /// than every frame.
+    hand_models_tried: [bool; 2],
 }
 
 impl EmulatorApp {
@@ -175,12 +196,18 @@ impl EmulatorApp {
             camera.position = Vec3::new(centre.x, min.y + 1.6, centre.z);
         }
 
-        let controller_settings = ControllerSettings::load_or_create(
-            environment_path.parent().unwrap_or_else(|| Path::new(".")),
-        );
+        let directory = environment_path.parent().unwrap_or_else(|| Path::new("."));
+
+        let controller_settings = ControllerSettings::load_or_create(directory);
         let controllers = [
             ControllerState::new(&controller_settings, Hand::Left),
             ControllerState::new(&controller_settings, Hand::Right),
+        ];
+
+        let hand_settings = HandSettings::load_or_create(directory);
+        let hands = [
+            HandState::new(&hand_settings, Hand::Left),
+            HandState::new(&hand_settings, Hand::Right),
         ];
 
         Self {
@@ -203,8 +230,13 @@ impl EmulatorApp {
             controller_settings,
             controllers,
             controller_ui: ControllerUi::new(),
+            hand_settings,
+            hands,
+            pose_overlay: PoseOverlay::new(),
             timed_releases: Vec::new(),
             loaded_models: [None, None],
+            hand_models: [None, None],
+            hand_models_tried: [false; 2],
         }
     }
 
@@ -336,7 +368,15 @@ impl EmulatorApp {
                     let state = &mut self.controllers[hand.index()];
                     if let Some(enabled) = enabled {
                         state.enabled = enabled;
+
+                        // The same exclusion the toolbar toggles apply: a side is a controller or
+                        // a hand, never both.
+                        if enabled {
+                            self.hands[hand.index()].enabled = false;
+                        }
                     }
+
+                    let state = &mut self.controllers[hand.index()];
                     if let Some(visible) = visible {
                         state.model_visible = visible;
                     }
@@ -384,6 +424,84 @@ impl EmulatorApp {
         }
     }
 
+    /// Applies hand changes queued by the hand API endpoints.
+    fn apply_hand_commands(&mut self) {
+        while let Some(command) = self.shared.hand_commands.lock().pop_front() {
+            match command {
+                HandCommand::Configure {
+                    hand,
+                    enabled,
+                    visible,
+                } => {
+                    if let Some(enabled) = enabled {
+                        self.hands[hand.index()].enabled = enabled;
+
+                        if enabled {
+                            self.controllers[hand.index()].enabled = false;
+                        }
+                    }
+                    if let Some(visible) = visible {
+                        self.hands[hand.index()].model_visible = visible;
+                    }
+                }
+                HandCommand::SetPose {
+                    hand,
+                    position,
+                    orientation,
+                } => {
+                    let state = &mut self.hands[hand.index()];
+                    if let Some(position) = position {
+                        state.position = position;
+                    }
+                    if let Some(orientation) = orientation {
+                        state.orientation = orientation;
+                    }
+                }
+                HandCommand::SetArticulation {
+                    hand,
+                    pose,
+                    articulation,
+                    transition,
+                } => {
+                    let settings = &self.hand_settings;
+                    let index = pose.as_deref().and_then(|name| settings.find_pose(name));
+                    let state = &mut self.hands[hand.index()];
+
+                    match index {
+                        // A plain pose selection behaves exactly as clicking its button does,
+                        // including keeping the pose named in the snapshot.
+                        Some(index) if articulation.is_default() => {
+                            state.select_pose(settings, index, transition);
+                        }
+                        // Loose articulation fields are applied on top of the named pose, so a
+                        // caller can ask for "Pinch, but with the little finger out" without
+                        // spelling out a whole articulation. Without a pose they modify what is
+                        // held.
+                        _ => {
+                            let base = match index {
+                                Some(index) => settings.pose_at(index),
+                                None => state.pose,
+                            };
+                            let duration = transition
+                                .or_else(|| index.and_then(|index| settings.poses[index].transition))
+                                .unwrap_or(settings.transition);
+
+                            state.set_articulation(articulation.apply(base), duration);
+                        }
+                    }
+                }
+                HandCommand::PlayGesture { hand, gesture } => {
+                    if let Some(index) = self.hand_settings.find_gesture(&gesture) {
+                        self.hands[hand.index()].play_gesture(&self.hand_settings, index);
+                    }
+                }
+                HandCommand::Reset { hand } => {
+                    self.hands[hand.index()].reset(&self.hand_settings, hand);
+                }
+            }
+        }
+    }
+
     /// Releases inputs whose click duration has elapsed.
     fn apply_timed_releases(&mut self) {
         let now = Instant::now();
@@ -409,9 +527,32 @@ impl EmulatorApp {
         let head_orientation = self.camera.orientation();
 
         let mut tracked = [TrackedController::default(); 2];
+        let mut tracked_hands = [TrackedHand::default(); 2];
         let mut desired = HashMap::new();
         let mut profile_id = None;
         let mut input_ids = HashSet::new();
+
+        for hand in Hand::BOTH {
+            let index = hand.index();
+            let state = &self.hands[index];
+
+            if !state.enabled {
+                continue;
+            }
+
+            // Head-relative, like the controllers: the palm pose places the whole skeleton, and
+            // the tracking thread composes it with the head pose going out in the same packet.
+            let palm = Pose {
+                orientation: state.orientation.normalize(),
+                position: state.position,
+            };
+            let local = state.local_skeleton(&self.hand_settings, hand);
+
+            tracked_hands[index] = TrackedHand {
+                enabled: true,
+                joints: std::array::from_fn(|joint| palm * local[joint]),
+            };
+        }
 
         for hand in Hand::BOTH {
             let index = hand.index();
@@ -449,6 +590,7 @@ impl EmulatorApp {
                 orientation: head_orientation,
             },
             controllers: tracked,
+            hands: tracked_hands,
         });
 
         client.sync_buttons(&desired);
@@ -547,6 +689,176 @@ impl EmulatorApp {
 
             self.loaded_models[index] = Some(controller.profile_index);
         }
+    }
+
+    /// World-space skinning matrices of the hands whose model should be drawn, composed with the
+    /// given head pose (the live camera, or the displayed video frame's pose).
+    ///
+    /// The matrices are built from the very joints being sent on the wire, so the hand that is
+    /// drawn is the hand the server is being told about, which is the whole point of the display
+    /// toggle.
+    fn hand_joint_matrices(
+        &self,
+        head_position: Vec3,
+        head_orientation: Quat,
+    ) -> [Option<Vec<Mat4>>; 2] {
+        std::array::from_fn(|index| {
+            let state = &self.hands[index];
+            let model = self.hand_models[index].as_ref()?;
+
+            if !(state.enabled && state.model_visible) {
+                return None;
+            }
+
+            let hand = Hand::BOTH[index];
+            let local = state.local_skeleton(&self.hand_settings, hand);
+            let palm = Mat4::from_rotation_translation(
+                (head_orientation * state.orientation).normalize(),
+                head_position + head_orientation * state.position,
+            );
+
+            Some(
+                model
+                    .joint_matrices(&local, self.hand_settings.hand_length)
+                    .into_iter()
+                    .map(|joint| palm * joint)
+                    .collect(),
+            )
+        })
+    }
+
+    /// Loads the hand models and uploads them to the GPU, once, when a hand is first shown.
+    ///
+    /// Unlike the controllers there is nothing to reload on: the models come from the settings
+    /// file and do not change while the emulator runs. A file that fails to load is reported once
+    /// and the hand simply is not drawn; the joints still go on the wire, so a missing model
+    /// costs the picture, not the emulation.
+    fn ensure_hand_models(&mut self, frame: &Frame) {
+        if !Hand::BOTH.iter().any(|hand| {
+            let state = &self.hands[hand.index()];
+
+            state.enabled && state.model_visible && !self.hand_models_tried[hand.index()]
+        }) {
+            return;
+        }
+
+        let Some(state) = frame.wgpu_render_state() else {
+            return;
+        };
+
+        let renderer = state
+            .renderer
+            .read()
+            .callback_resources
+            .get::<Arc<Mutex<HandRenderer>>>()
+            .cloned();
+
+        let renderer = match renderer {
+            Some(renderer) => renderer,
+            None => {
+                let created = Arc::new(Mutex::new(HandRenderer::new(
+                    &state.device,
+                    &state.queue,
+                    state.target_format,
+                )));
+
+                state
+                    .renderer
+                    .write()
+                    .callback_resources
+                    .insert(Arc::clone(&created));
+
+                created
+            }
+        };
+
+        for hand in Hand::BOTH {
+            let index = hand.index();
+
+            if !(self.hands[index].enabled && self.hands[index].model_visible)
+                || self.hand_models_tried[index]
+            {
+                continue;
+            }
+
+            self.hand_models_tried[index] = true;
+
+            let Some(path) = self.hand_settings.models[index].as_ref() else {
+                info!("No hand model configured for the {} hand", hand.side());
+                continue;
+            };
+
+            match SkinnedModel::load(
+                path,
+                hand,
+                self.hand_settings.hand_length,
+                &self.hand_settings.joint_names,
+            ) {
+                Ok(model) => {
+                    renderer.lock().set_model(
+                        &state.device,
+                        &state.queue,
+                        index,
+                        &model,
+                        HandTint {
+                            skin: self.hand_settings.model_color,
+                            glove: self.hand_settings.glove_color,
+                        },
+                    );
+
+                    self.hand_models[index] = Some(model);
+                }
+                Err(e) => error!("Cannot load hand model {}: {e:#}", path.display()),
+            }
+        }
+    }
+
+    /// Publishes the current hand state for `GET /api/hands`.
+    fn publish_hands(&self) {
+        let snapshot = |hand: Hand| -> HandSnapshot {
+            let state = &self.hands[hand.index()];
+
+            HandSnapshot {
+                enabled: state.enabled,
+                visible: state.model_visible,
+                position: state.position.to_array(),
+                orientation: state.orientation.to_array(),
+                pose: state
+                    .pose_index
+                    .and_then(|index| self.hand_settings.poses.get(index))
+                    .map(|pose| pose.name.clone()),
+                gesture: state
+                    .playing_gesture()
+                    .and_then(|index| self.hand_settings.gestures.get(index))
+                    .map(|gesture| gesture.name.clone()),
+                articulation: Articulation::from_pose(&state.pose),
+                moving: state
+                    .progress(&self.hand_settings, Instant::now())
+                    .is_some(),
+            }
+        };
+
+        let summarise = |name: &String, description: &String| NamedSummary {
+            name: name.clone(),
+            description: description.clone(),
+        };
+
+        *self.shared.hands.lock() = HandsResponse {
+            poses: self
+                .hand_settings
+                .poses
+                .iter()
+                .map(|pose| summarise(&pose.name, &pose.description))
+                .collect(),
+            gestures: self
+                .hand_settings
+                .gestures
+                .iter()
+                .map(|gesture| summarise(&gesture.name, &gesture.description))
+                .collect(),
+            left: snapshot(Hand::Left),
+            right: snapshot(Hand::Right),
+        };
     }
 
     /// Publishes the current controller state for `GET /api/controllers`.
@@ -684,16 +996,25 @@ impl EmulatorApp {
             return;
         };
 
-        // Visible controller models are captured too, so the API sees what the window shows.
+        // Visible controller and hand models are captured too, so the API sees what the window
+        // shows.
         let controller_renderer = state
             .renderer
             .read()
             .callback_resources
             .get::<Arc<Mutex<ControllerRenderer>>>()
             .cloned();
+        let hand_renderer = state
+            .renderer
+            .read()
+            .callback_resources
+            .get::<Arc<Mutex<HandRenderer>>>()
+            .cloned();
         // Captures render the scene live, so the live camera is the right head pose here.
         let controller_models =
             self.controller_model_matrices(self.camera.position, self.camera.orientation());
+        let hand_poses =
+            self.hand_joint_matrices(self.camera.position, self.camera.orientation());
 
         // Capture at the negotiated stream resolution when streaming, so captures are deterministic
         // and independent of the window size.
@@ -711,15 +1032,27 @@ impl EmulatorApp {
             };
 
             let controller_lock = controller_renderer.as_ref().map(|renderer| renderer.lock());
-            let controllers = controller_lock
-                .as_ref()
-                .map(|renderer| (&**renderer, controller_models));
+            let hand_lock = hand_renderer.as_ref().map(|renderer| renderer.lock());
+
+            let devices = DeviceModels {
+                controllers: controller_lock
+                    .as_ref()
+                    .map(|renderer| (&**renderer, controller_models)),
+                hands: hand_lock.as_ref().map(|renderer| {
+                    (
+                        &**renderer,
+                        std::array::from_fn(|hand| {
+                            hand_poses[hand].as_deref()
+                        }),
+                    )
+                }),
+            };
 
             let pixels = capture_stereo(
                 &state.device,
                 &state.queue,
                 &renderer,
-                controllers,
+                &devices,
                 &self.camera,
                 eye_width,
                 eye_height,
@@ -870,7 +1203,56 @@ impl EmulatorApp {
                 });
             });
 
-            controller_ui::toolbar_row(ui, &mut self.controllers, &self.controller_settings);
+            self.draw_inputs_row(ui);
+        });
+    }
+
+    /// The inputs row: the controller section and the hand section side by side, since a side can
+    /// be emulated as one or the other and the two toggles belong next to each other.
+    fn draw_inputs_row(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Inputs:");
+            ui.separator();
+
+            let mut hands_enabled = [self.hands[0].enabled, self.hands[1].enabled];
+            controller_ui::toolbar_row(
+                ui,
+                &mut self.controllers,
+                &mut hands_enabled,
+                &self.controller_settings,
+            );
+            for (state, enabled) in self.hands.iter_mut().zip(hands_enabled) {
+                state.enabled = enabled;
+            }
+
+            ui.separator();
+
+            hand_ui::toolbar_row(
+                ui,
+                &mut self.hands,
+                &mut self.controllers,
+                &self.hand_settings,
+            );
+
+            let controllers = self.controllers.iter().any(|state| state.enabled);
+            let hands = self.hands.iter().any(|state| state.enabled);
+
+            let hint = match (controllers, hands) {
+                (true, true) => Some("Hover an icon to move a device; the corner panels drive it"),
+                (true, false) => {
+                    Some("Hover a controller icon to move it; use the corner panels for buttons")
+                }
+                (false, true) => {
+                    Some("Hover a hand icon to move it; pick a gesture in the corner panels")
+                }
+                (false, false) => None,
+            };
+
+            if let Some(hint) = hint {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(hint).weak());
+                });
+            }
         });
     }
 }
@@ -889,11 +1271,20 @@ impl App for EmulatorApp {
 
         self.apply_pending_moves();
         self.apply_controller_commands();
+        self.apply_hand_commands();
         self.apply_timed_releases();
+
+        // Gesture transitions run on wall time rather than on frames, so a slow frame does not
+        // stretch the animation.
+        for state in self.hands.iter_mut() {
+            state.advance(&self.hand_settings, now);
+        }
+
         self.update_camera(&ui_context, delta_seconds);
         let camera = self.camera;
 
         self.ensure_controller_models(frame);
+        self.ensure_hand_models(frame);
         let displayed_frame = self.upload_decoded_frame(frame);
         // The world-space eye poses the displayed frame was rendered with. Also reports the
         // compositor start for the frame pacing statistics.
@@ -936,6 +1327,7 @@ impl App for EmulatorApp {
         };
         let controller_models =
             self.controller_model_matrices(overlay_position, overlay_orientation);
+        let hand_poses = self.hand_joint_matrices(overlay_position, overlay_orientation);
         let mut look_requested = LookRequest::None;
 
         let view_rect = egui::CentralPanel::default()
@@ -976,7 +1368,8 @@ impl App for EmulatorApp {
                         show_video,
                         video_eye_aspect,
                         controller_models,
-                        controller_eye_views: overlay_eye_views,
+                        hand_poses,
+                        device_eye_views: overlay_eye_views,
                     },
                 ));
 
@@ -1006,15 +1399,45 @@ impl App for EmulatorApp {
         }
 
         if let Some(view_rect) = view_rect {
-            let views =
-                view_sub_rects(view_mode, view_rect, video_eye_aspect, overlay_eye_views);
+            let views = view_sub_rects(view_mode, view_rect, video_eye_aspect, overlay_eye_views);
 
-            self.controller_ui.view_overlays(
+            // The controllers and the hands are posed by one implementation, so they are collected
+            // into one list of enabled devices. The borrows are split by hand and by kind, so no
+            // two targets alias.
+            let controller_sensitivity = self.controller_settings.rotation_sensitivity;
+            let hand_sensitivity = self.hand_settings.rotation_sensitivity;
+
+            let mut targets = Vec::with_capacity(4);
+
+            for (index, state) in self.controllers.iter_mut().enumerate() {
+                if state.enabled {
+                    targets.push(PoseTarget {
+                        slot: Slot::controller(Hand::BOTH[index]),
+                        position: &mut state.position,
+                        orientation: &mut state.orientation,
+                        aim: Vec3::NEG_Z,
+                        rotation_sensitivity: controller_sensitivity,
+                    });
+                }
+            }
+
+            for (index, state) in self.hands.iter_mut().enumerate() {
+                if state.enabled {
+                    targets.push(PoseTarget {
+                        slot: Slot::hand(Hand::BOTH[index]),
+                        position: &mut state.position,
+                        orientation: &mut state.orientation,
+                        aim: hands::aim_direction(Hand::BOTH[index]),
+                        rotation_sensitivity: hand_sensitivity,
+                    });
+                }
+            }
+
+            self.pose_overlay.run(
                 &ui_context,
                 &views,
                 (overlay_position, overlay_orientation),
-                &mut self.controllers,
-                &self.controller_settings,
+                &mut targets,
                 interactive,
             );
         }
@@ -1023,6 +1446,13 @@ impl App for EmulatorApp {
             &ui_context,
             &mut self.controllers,
             &self.controller_settings,
+            interactive,
+        );
+
+        hand_ui::hand_panels(
+            &ui_context,
+            &mut self.hands,
+            &self.hand_settings,
             interactive,
         );
 
@@ -1051,6 +1481,7 @@ impl App for EmulatorApp {
         self.service_captures(frame);
         self.publish_state();
         self.publish_controllers();
+        self.publish_hands();
 
         // Completes the pacing report for the frame shown this repaint.
         self.client().finish_frame();
@@ -1117,9 +1548,35 @@ struct ViewportCallback {
     /// VR application renders its own controllers, but the local models show what the emulator is
     /// actually sending, which is the point of the display toggle.
     controller_models: [Option<Mat4>; 2],
-    /// Per-eye view matrices the controller models are drawn with: the displayed video frame's
-    /// eye poses in video mode, the live camera's in scene mode. Left is index 0.
-    controller_eye_views: [Mat4; 2],
+    /// World-space skinning matrices of the hands to draw, for the same reason.
+    hand_poses: [Option<Vec<Mat4>>; 2],
+    /// Per-eye view matrices the device models are drawn with: the displayed video frame's eye
+    /// poses in video mode, the live camera's in scene mode. Left is index 0.
+    device_eye_views: [Mat4; 2],
+}
+
+impl ViewportCallback {
+    /// The device models to draw, resolved against the renderers in the callback resources.
+    ///
+    /// Both renderers are created lazily, so either may be missing; a device with nothing to draw
+    /// simply contributes nothing.
+    fn devices<'resources>(
+        &'resources self,
+        controllers: Option<&'resources ControllerRenderer>,
+        hands: Option<&'resources HandRenderer>,
+    ) -> DeviceModels<'resources> {
+        DeviceModels {
+            controllers: controllers.map(|renderer| (renderer, self.controller_models)),
+            hands: hands.map(|renderer| {
+                (
+                    renderer,
+                    std::array::from_fn(|hand| {
+                        self.hand_poses[hand].as_deref()
+                    }),
+                )
+            }),
+        }
+    }
 }
 
 impl egui_wgpu::CallbackTrait for ViewportCallback {
@@ -1160,28 +1617,26 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             renderer.set_view(queue, &camera, Eye::Right, aspect_ratio);
         }
 
-        if let Some(renderer) = resources.get::<Arc<Mutex<ControllerRenderer>>>() {
-            let renderer = renderer.lock();
+        // Over the video the models must use the projection the server rendered with — the
+        // advertised FOV — not the window's shape, or they drift against the video content.
+        let device_aspect = if self.show_video {
+            Camera::fov_aspect_ratio()
+        } else {
+            aspect_ratio
+        };
 
-            // Over the video the models must use the projection the server rendered with — the
-            // advertised FOV — not the window's shape, or they drift against the video content.
-            let controller_aspect = if self.show_video {
-                Camera::fov_aspect_ratio()
-            } else {
-                aspect_ratio
-            };
+        let controllers = resources.get::<Arc<Mutex<ControllerRenderer>>>().map(|r| r.lock());
+        let hands = resources.get::<Arc<Mutex<HandRenderer>>>().map(|r| r.lock());
 
-            for (index, eye) in [Eye::Left, Eye::Right].into_iter().enumerate() {
-                let view_proj = Camera::projection_matrix(controller_aspect)
-                    * self.controller_eye_views[index];
-
-                for (hand, model) in self.controller_models.iter().enumerate() {
-                    if let Some(model) = model {
-                        renderer.set_view(queue, hand, eye, view_proj * *model);
-                    }
-                }
-            }
-        }
+        self.devices(
+            controllers.as_deref(),
+            hands.as_deref(),
+        )
+        .upload(
+            queue,
+            self.device_eye_views,
+            Camera::projection_matrix(device_aspect),
+        );
 
         let _ = screen_descriptor;
 
@@ -1207,12 +1662,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             .then(|| resources.get::<Arc<Mutex<VideoRenderer>>>())
             .flatten();
         let scene = resources.get::<Arc<SceneRenderer>>();
-        let controllers = self
-            .controller_models
-            .iter()
-            .any(Option::is_some)
-            .then(|| resources.get::<Arc<Mutex<ControllerRenderer>>>())
-            .flatten();
+        let controllers = resources.get::<Arc<Mutex<ControllerRenderer>>>().map(|r| r.lock());
+        let hands = resources.get::<Arc<Mutex<HandRenderer>>>().map(|r| r.lock());
+        let devices = self.devices(controllers.as_deref(), hands.as_deref());
 
         if video.is_none() && scene.is_none() {
             return;
@@ -1228,17 +1680,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 }
             }
 
-            // Over the video too: the application draws its own controllers, but the local models
-            // show what the emulator is sending, which is what the display toggle is for.
-            if let Some(renderer) = &controllers {
-                let renderer = renderer.lock();
-
-                for (hand, model) in self.controller_models.iter().enumerate() {
-                    if model.is_some() {
-                        renderer.draw(pass, hand, eye);
-                    }
-                }
-            }
+            // Over the video too: the application draws its own controllers and hands, but the
+            // local models show what the emulator is sending, which is what the display toggle is
+            // for.
+            devices.draw(pass, eye);
         };
 
         // The video keeps its own aspect ratio, displayed inner-fit within the eye's part of the

@@ -4,7 +4,7 @@
 //! shared state plus a request channel for anything needing the GPU. Rendering must happen on the
 //! thread owning the wgpu device, so capture requests are queued and answered by the UI thread.
 
-use crate::{client::FrameTiming, controllers::Hand};
+use crate::{client::FrameTiming, controllers::Hand, hands::HandPose};
 use alvr_common::{
     glam::{Quat, Vec3},
     info,
@@ -201,6 +201,174 @@ struct ControllerClickRequest {
     duration: Option<f32>,
 }
 
+/// Snapshot of both emulated hands, published by the UI thread every frame and serialised straight
+/// out to `GET /api/hands`.
+#[derive(Serialize, Clone, Default)]
+pub struct HandsResponse {
+    /// The articulations available for selection, in the order the panels show them.
+    pub poses: Vec<NamedSummary>,
+    /// The timed sequences of those poses.
+    pub gestures: Vec<NamedSummary>,
+    pub left: HandSnapshot,
+    pub right: HandSnapshot,
+}
+
+#[derive(Serialize, Clone)]
+pub struct NamedSummary {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct HandSnapshot {
+    pub enabled: bool,
+    pub visible: bool,
+    /// Head-relative palm position: X right, Y up, -Z forward.
+    pub position: [f32; 3],
+    /// Head-relative palm orientation quaternion, XYZW.
+    pub orientation: [f32; 4],
+    /// The selected pose, or `null` when the articulation was set directly.
+    pub pose: Option<String>,
+    /// The gesture playing right now, if any.
+    pub gesture: Option<String>,
+    /// The articulation currently being sent, which mid-movement is between two poses.
+    pub articulation: Articulation,
+    /// Whether a pose change or a gesture is still running.
+    pub moving: bool,
+}
+
+impl Default for HandSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            visible: false,
+            position: [0.0; 3],
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            pose: None,
+            gesture: None,
+            articulation: Articulation::default(),
+            moving: false,
+        }
+    }
+}
+
+/// A hand's articulation as the API expresses it: a curl per digit plus the two whole-hand
+/// controls. Every field is optional on the way in, keeping its current value when omitted.
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
+pub struct Articulation {
+    pub thumb: Option<f32>,
+    pub index: Option<f32>,
+    pub middle: Option<f32>,
+    pub ring: Option<f32>,
+    pub little: Option<f32>,
+    pub spread: Option<f32>,
+    pub thumb_opposition: Option<f32>,
+}
+
+impl Articulation {
+    pub fn from_pose(pose: &HandPose) -> Self {
+        Self {
+            thumb: Some(pose.curl[0]),
+            index: Some(pose.curl[1]),
+            middle: Some(pose.curl[2]),
+            ring: Some(pose.curl[3]),
+            little: Some(pose.curl[4]),
+            spread: Some(pose.spread),
+            thumb_opposition: Some(pose.thumb_opposition),
+        }
+    }
+
+    /// Applies the fields that were given on top of an existing articulation.
+    pub fn apply(&self, base: HandPose) -> HandPose {
+        HandPose {
+            curl: [
+                self.thumb.unwrap_or(base.curl[0]),
+                self.index.unwrap_or(base.curl[1]),
+                self.middle.unwrap_or(base.curl[2]),
+                self.ring.unwrap_or(base.curl[3]),
+                self.little.unwrap_or(base.curl[4]),
+            ],
+            spread: self.spread.unwrap_or(base.spread),
+            thumb_opposition: self.thumb_opposition.unwrap_or(base.thumb_opposition),
+        }
+    }
+
+    /// Whether the request left every field out, meaning it asks for no articulation change.
+    pub fn is_default(&self) -> bool {
+        [
+            self.thumb,
+            self.index,
+            self.middle,
+            self.ring,
+            self.little,
+            self.spread,
+            self.thumb_opposition,
+        ]
+        .iter()
+        .all(Option::is_none)
+    }
+}
+
+/// A pending hand change, applied by the UI thread on the next frame.
+pub enum HandCommand {
+    Configure {
+        hand: Hand,
+        enabled: Option<bool>,
+        visible: Option<bool>,
+    },
+    SetPose {
+        hand: Hand,
+        position: Option<Vec3>,
+        orientation: Option<Quat>,
+    },
+    /// Move to a named pose from the settings, or to an articulation given outright. `transition`
+    /// overrides the configured time, and zero applies it immediately.
+    SetArticulation {
+        hand: Hand,
+        pose: Option<String>,
+        articulation: Articulation,
+        transition: Option<Duration>,
+    },
+    /// Play a timed gesture from the settings, from its beginning.
+    PlayGesture { hand: Hand, gesture: String },
+    Reset {
+        hand: Hand,
+    },
+}
+
+/// Body of `POST /api/hands/{hand}`. Omitted fields keep their current value.
+#[derive(Deserialize)]
+struct HandConfigRequest {
+    enabled: Option<bool>,
+    visible: Option<bool>,
+}
+
+/// Body of `POST /api/hands/{hand}/pose`. Omitted fields keep their current value.
+#[derive(Deserialize)]
+struct HandPoseRequest {
+    /// Head-relative palm position: X right, Y up, -Z forward.
+    position: Option<[f32; 3]>,
+    /// Head-relative palm orientation quaternion, XYZW. Normalised on apply.
+    orientation: Option<[f32; 4]>,
+}
+
+/// Body of `POST /api/hands/{hand}/articulation`. Either names a pose or gives the articulation
+/// directly; giving both applies the named pose with the given fields overridden.
+#[derive(Deserialize)]
+struct HandArticulationRequest {
+    pose: Option<String>,
+    #[serde(flatten)]
+    articulation: Articulation,
+    /// Transition time in seconds, overriding the configured one. Zero applies immediately.
+    transition_seconds: Option<f32>,
+}
+
+/// Body of `POST /api/hands/{hand}/gesture`.
+#[derive(Deserialize)]
+struct HandGestureRequest {
+    gesture: String,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CaptureRequestKind {
     Color,
@@ -247,12 +415,16 @@ pub struct SharedState {
     pub state: Mutex<StateResponse>,
     /// Latest controller snapshot published by the UI thread, for `/api/controllers`.
     pub controllers: Mutex<ControllersResponse>,
+    /// Latest hand snapshot published by the UI thread, for `/api/hands`.
+    pub hands: Mutex<HandsResponse>,
     /// Pose changes queued by `/api/move`.
     pub moves: Mutex<VecDeque<PendingMove>>,
     /// Held camera input set by `/api/drive`, merged into every frame's input until changed.
     pub drive: Mutex<DriveRequest>,
     /// Controller changes queued by the controller endpoints.
     pub controller_commands: Mutex<VecDeque<ControllerCommand>>,
+    /// Hand changes queued by the hand endpoints.
+    pub hand_commands: Mutex<VecDeque<HandCommand>>,
     /// Capture requests queued by the view endpoints.
     pub captures: Mutex<VecDeque<CaptureRequest>>,
 }
@@ -262,9 +434,11 @@ impl SharedState {
         Self {
             state: Mutex::new(initial),
             controllers: Mutex::new(ControllersResponse::default()),
+            hands: Mutex::new(HandsResponse::default()),
             moves: Mutex::new(VecDeque::new()),
             drive: Mutex::new(DriveRequest::default()),
             controller_commands: Mutex::new(VecDeque::new()),
+            hand_commands: Mutex::new(VecDeque::new()),
             captures: Mutex::new(VecDeque::new()),
         }
     }
@@ -325,6 +499,23 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
 
             let rest = &path["/api/controllers/".len()..];
             controller_route(shared, rest, &body)
+        }
+
+        (tiny_http::Method::Get, "/api/hands") => {
+            match serde_json::to_string_pretty(&*shared.hands.lock()) {
+                Ok(json) => Reply::Json(json),
+                Err(e) => Reply::Error(500, format!("Cannot serialise hands: {e}")),
+            }
+        }
+
+        (tiny_http::Method::Post, path) if path.starts_with("/api/hands/") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                return Reply::Error(400, format!("Cannot read request body: {e}"));
+            }
+
+            let rest = &path["/api/hands/".len()..];
+            hand_route(shared, rest, &body)
         }
 
         (tiny_http::Method::Get, "/api/view/color") => capture(shared, CaptureRequestKind::Color),
@@ -413,6 +604,145 @@ fn controller_route(shared: &SharedState, rest: &str, body: &str) -> Reply {
         }
         Err(message) => Reply::Error(400, message),
     }
+}
+
+/// Dispatches `POST /api/hands/{hand}[/...]` requests, mirroring the controller routes: validated
+/// here against the last published snapshot, applied by the UI thread on its next frame.
+fn hand_route(shared: &SharedState, rest: &str, body: &str) -> Reply {
+    let (side, action) = match rest.split_once('/') {
+        Some((side, action)) => (side, action),
+        None => (rest, ""),
+    };
+
+    let Some(hand) = Hand::from_side(side) else {
+        return Reply::Error(404, format!("No such hand: {side} (use left or right)"));
+    };
+
+    let body = if body.trim().is_empty() { "{}" } else { body };
+
+    let command = match action {
+        "" => parse_hand_configure(hand, body),
+        "pose" => parse_hand_pose(hand, body),
+        "articulation" => parse_hand_articulation(shared, hand, body),
+        "gesture" => parse_hand_gesture(shared, hand, body),
+        "reset" => Ok(HandCommand::Reset { hand }),
+        _ => {
+            return Reply::Error(404, format!("No such hand endpoint: {action}"));
+        }
+    };
+
+    match command {
+        Ok(command) => {
+            shared.hand_commands.lock().push_back(command);
+            Reply::Json("{\"ok\":true}".into())
+        }
+        Err(message) => Reply::Error(400, message),
+    }
+}
+
+fn parse_hand_configure(hand: Hand, body: &str) -> Result<HandCommand, String> {
+    let parsed: HandConfigRequest =
+        serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {e}"))?;
+
+    Ok(HandCommand::Configure {
+        hand,
+        enabled: parsed.enabled,
+        visible: parsed.visible,
+    })
+}
+
+fn parse_hand_pose(hand: Hand, body: &str) -> Result<HandCommand, String> {
+    let parsed: HandPoseRequest =
+        serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {e}"))?;
+
+    let orientation = match parsed.orientation {
+        Some(values) => {
+            let quat = Quat::from_array(values);
+            if quat.length_squared() < f32::EPSILON {
+                return Err("Orientation quaternion must not be zero".into());
+            }
+            Some(quat.normalize())
+        }
+        None => None,
+    };
+
+    Ok(HandCommand::SetPose {
+        hand,
+        position: parsed.position.map(Vec3::from_array),
+        orientation,
+    })
+}
+
+fn parse_hand_articulation(
+    shared: &SharedState,
+    hand: Hand,
+    body: &str,
+) -> Result<HandCommand, String> {
+    let parsed: HandArticulationRequest =
+        serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {e}"))?;
+
+    if parsed.pose.is_none() && parsed.articulation.is_default() {
+        return Err(
+            "Give a 'pose' name, or one or more of thumb, index, middle, ring, little, spread \
+             and thumb_opposition"
+                .into(),
+        );
+    }
+
+    if let Some(pose) = &parsed.pose {
+        known_name(shared, pose, false)?;
+    }
+
+    let transition = match parsed.transition_seconds {
+        Some(seconds) if !(0.0..=10.0).contains(&seconds) => {
+            return Err("Transition must be between 0 and 10 seconds".into());
+        }
+        Some(seconds) => Some(Duration::from_secs_f32(seconds)),
+        None => None,
+    };
+
+    Ok(HandCommand::SetArticulation {
+        hand,
+        pose: parsed.pose,
+        articulation: parsed.articulation,
+        transition,
+    })
+}
+
+fn parse_hand_gesture(shared: &SharedState, hand: Hand, body: &str) -> Result<HandCommand, String> {
+    let parsed: HandGestureRequest =
+        serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {e}"))?;
+
+    known_name(shared, &parsed.gesture, true)?;
+
+    Ok(HandCommand::PlayGesture {
+        hand,
+        gesture: parsed.gesture,
+    })
+}
+
+/// Checks a pose or gesture name against the last published snapshot, so the caller gets a proper
+/// error listing what is available rather than the command being dropped on the UI thread.
+fn known_name(shared: &SharedState, name: &str, gesture: bool) -> Result<(), String> {
+    let snapshot = shared.hands.lock();
+    let list = if gesture {
+        &snapshot.gestures
+    } else {
+        &snapshot.poses
+    };
+
+    if list.iter().any(|known| known.name.eq_ignore_ascii_case(name)) {
+        return Ok(());
+    }
+
+    let kind = if gesture { "gesture" } else { "pose" };
+    let names = list
+        .iter()
+        .map(|known| known.name.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Err(format!("Unknown {kind} '{name}'. Available: {names}"))
 }
 
 fn parse_configure(shared: &SharedState, hand: Hand, body: &str) -> Result<ControllerCommand, String> {

@@ -7,8 +7,9 @@
 use crate::{
     camera::{Camera, Eye},
     scene::Scene,
+    skinned::{SkinnedModel, SkinnedVertex},
 };
-use alvr_common::glam::Mat4;
+use alvr_common::{glam::Mat4, warn};
 use bytemuck::{Pod, Zeroable};
 use std::num::NonZeroU32;
 use wgpu::{
@@ -383,6 +384,435 @@ impl ControllerRenderer {
     }
 }
 
+/// Most skin joints a hand model may have, matching the array in `hand.wgsl`.
+const MAX_SKIN_JOINTS: usize = 64;
+
+/// What a hand model is tinted with: one colour, or two when the model is a fingerless glove.
+#[derive(Clone, Copy)]
+pub struct HandTint {
+    /// Bare skin, past the cuff.
+    pub skin: [f32; 3],
+    /// The glove itself. `None` tints the whole model as skin.
+    pub glove: Option<[f32; 3]>,
+}
+
+impl HandTint {
+    /// The colour at a vertex that is `bare` bare skin and the rest glove.
+    fn at(&self, bare: f32) -> [f32; 3] {
+        let Some(glove) = self.glove else {
+            return self.skin;
+        };
+
+        // Smoothstepped across the blended ring of vertices at the cuff, so the seam follows the
+        // modelled ridge instead of stepping between whole vertices.
+        let bare = bare.clamp(0.0, 1.0);
+        let alpha = bare * bare * (3.0 - 2.0 * bare);
+
+        std::array::from_fn(|channel| glove[channel] + (self.skin[channel] - glove[channel]) * alpha)
+    }
+}
+
+/// The skinned-mesh pipeline and the resources every hand's bind group references.
+///
+/// Separate from [`MeshPipeline`] because the vertex format carries joint influences and the
+/// fragment stage shades from the normal: a hand model is a bare mesh with no baked lighting, so
+/// the scene's unlit path would draw it as a flat silhouette.
+struct SkinPipeline {
+    pipeline: RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    placeholder_view: TextureView,
+}
+
+impl SkinPipeline {
+    fn new(device: &Device, queue: &Queue, output_format: TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::include_wgsl!("hand.wgsl"));
+
+        let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("hand bind group layout"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::VERTEX,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<Uniforms>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::VERTEX,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        // The pose is the same for both eyes, so unlike the view matrix this one
+                        // is written once per frame.
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(skin_buffer_size()),
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("hand pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("hand pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SkinnedVertex>() as u64,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            format: VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        VertexAttribute {
+                            format: VertexFormat::Float32x3,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                        VertexAttribute {
+                            format: VertexFormat::Float32x2,
+                            offset: 24,
+                            shader_location: 2,
+                        },
+                        VertexAttribute {
+                            format: VertexFormat::Float32x3,
+                            offset: 32,
+                            shader_location: 3,
+                        },
+                        VertexAttribute {
+                            format: VertexFormat::Uint16x4,
+                            offset: 44,
+                            shader_location: 4,
+                        },
+                        VertexAttribute {
+                            format: VertexFormat::Float32x4,
+                            offset: 52,
+                            shader_location: 5,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format: output_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                // Left off for the same reason as the scene: a model that turns out to be wound
+                // the other way should look wrong-shaded, not full of holes.
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("hand base colour sampler"),
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::Repeat,
+            address_mode_w: AddressMode::Repeat,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+            sampler,
+            placeholder_view: create_placeholder_texture(device, queue),
+        }
+    }
+}
+
+/// Size of the joint matrix uniform block, which the shader declares as a fixed-length array.
+fn skin_buffer_size() -> u64 {
+    (MAX_SKIN_JOINTS * 16 * std::mem::size_of::<f32>()) as u64
+}
+
+/// The joint matrix block as bytes, padded to the array the shader declares.
+///
+/// Written whole rather than only as far as the pose reaches, so the joints a model does not have
+/// stay identities instead of holding a previous model's matrices. `glam`'s `Mat4` is not `Pod`
+/// here — bytemuck support is behind a feature this workspace does not enable — so the columns are
+/// laid out explicitly, which is the same order the GPU expects anyway.
+fn packed_matrices(matrices: &[Mat4]) -> Vec<u8> {
+    let mut floats = [0.0f32; MAX_SKIN_JOINTS * 16];
+
+    for (slot, target) in floats.chunks_exact_mut(16).enumerate() {
+        let matrix = matrices.get(slot).copied().unwrap_or(Mat4::IDENTITY);
+
+        target.copy_from_slice(&matrix.to_cols_array());
+    }
+
+    bytemuck::cast_slice(&floats).to_vec()
+}
+
+/// GPU form of one hand model.
+struct SkinnedMesh {
+    vertex_buffer: Buffer,
+    uniform_buffer: Buffer,
+    skin_buffer: Buffer,
+    primitives: Vec<GpuPrimitive>,
+    /// Joints the model actually has, so a pose is not uploaded past the end of the array.
+    joint_count: usize,
+}
+
+impl SkinnedMesh {
+    fn new(
+        device: &Device,
+        queue: &Queue,
+        pipeline: &SkinPipeline,
+        model: &SkinnedModel,
+        tint: HandTint,
+    ) -> Self {
+        // The configured colours are folded into the vertices rather than carried as uniforms,
+        // matching how the static loader bakes in the material factor. A hand model typically has
+        // no material at all, which would otherwise draw it plain white — and the one this ships
+        // against is a fingerless glove, which drawn in a single colour reads as an unexplained
+        // ridge across every finger rather than as a cuff.
+        let vertices = model
+            .vertices
+            .iter()
+            .zip(&model.bare_skin)
+            .map(|(vertex, bare)| {
+                let base = tint.at(*bare);
+
+                SkinnedVertex {
+                    color: [
+                        vertex.color[0] * base[0],
+                        vertex.color[1] * base[1],
+                        vertex.color[2] * base[2],
+                    ],
+                    ..*vertex
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("hand vertices"),
+            size: (vertices.len() * std::mem::size_of::<SkinnedVertex>()) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+        let uniform_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("hand uniforms"),
+            size: UNIFORM_STRIDE * 2,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let skin_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("hand joint matrices"),
+            size: skin_buffer_size(),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Until the first pose arrives the joints are identities, which draws the bind pose rather
+        // than collapsing every vertex onto the origin.
+        queue.write_buffer(&skin_buffer, 0, &packed_matrices(&[]));
+
+        let mut primitives = Vec::new();
+        for primitive in &model.primitives {
+            let index_buffer = device.create_buffer(&BufferDescriptor {
+                label: Some("hand indices"),
+                size: (primitive.indices.len() * std::mem::size_of::<u32>()) as u64,
+                usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&index_buffer, 0, bytemuck::cast_slice(&primitive.indices));
+
+            let texture_view = primitive
+                .texture
+                .as_ref()
+                .map(|texture| upload_texture(device, queue, texture));
+
+            let bind_group = device.create_bind_group(&BindGroupDescriptor {
+                label: Some("hand bind group"),
+                layout: &pipeline.bind_group_layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &uniform_buffer,
+                            offset: 0,
+                            size: wgpu::BufferSize::new(std::mem::size_of::<Uniforms>() as u64),
+                        }),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: skin_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::TextureView(
+                            texture_view.as_ref().unwrap_or(&pipeline.placeholder_view),
+                        ),
+                    },
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: BindingResource::Sampler(&pipeline.sampler),
+                    },
+                ],
+            });
+
+            primitives.push(GpuPrimitive {
+                index_buffer,
+                index_count: primitive.indices.len() as u32,
+                bind_group,
+            });
+        }
+
+        Self {
+            vertex_buffer,
+            uniform_buffer,
+            skin_buffer,
+            primitives,
+            joint_count: model.joints.len().min(MAX_SKIN_JOINTS),
+        }
+    }
+
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, eye: Eye) {
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+
+        let offset = eye_offset(eye) as u32;
+
+        for primitive in &self.primitives {
+            pass.set_bind_group(0, &primitive.bind_group, &[offset]);
+            pass.set_index_buffer(primitive.index_buffer.slice(..), IndexFormat::Uint32);
+            pass.draw_indexed(0..primitive.index_count, 0, 0..1);
+        }
+    }
+}
+
+/// Renders the emulated hands' skinned models into the scene view.
+///
+/// Separate from [`ControllerRenderer`] because the geometry is skinned, but used the same way:
+/// one model per hand, replaced when the settings name a different file.
+pub struct HandRenderer {
+    pipeline: SkinPipeline,
+    models: [Option<SkinnedMesh>; 2],
+}
+
+impl HandRenderer {
+    pub fn new(device: &Device, queue: &Queue, output_format: TextureFormat) -> Self {
+        Self {
+            pipeline: SkinPipeline::new(device, queue, output_format),
+            models: [None, None],
+        }
+    }
+
+    /// Uploads a hand model for one hand, replacing the previous one.
+    pub fn set_model(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        hand: usize,
+        model: &SkinnedModel,
+        tint: HandTint,
+    ) {
+        if model.joints.len() > MAX_SKIN_JOINTS {
+            warn!(
+                "The hand model has {} joints; only the first {MAX_SKIN_JOINTS} will be posed",
+                model.joints.len()
+            );
+        }
+
+        self.models[hand] = Some(SkinnedMesh::new(device, queue, &self.pipeline, model, tint));
+    }
+
+    /// Uploads the pose of one hand: the skinning matrices, already in world space.
+    pub fn set_pose(&self, queue: &Queue, hand: usize, matrices: &[Mat4]) {
+        let Some(mesh) = &self.models[hand] else {
+            return;
+        };
+
+        let count = matrices.len().min(mesh.joint_count);
+        if count == 0 {
+            return;
+        }
+
+        queue.write_buffer(&mesh.skin_buffer, 0, &packed_matrices(&matrices[..count]));
+    }
+
+    /// Uploads the view-projection matrix for one hand and eye. The model transform is already in
+    /// the joint matrices, so this is the view and projection alone.
+    pub fn set_view(&self, queue: &Queue, hand: usize, eye: Eye, view_proj: Mat4) {
+        if let Some(mesh) = &self.models[hand] {
+            queue.write_buffer(
+                &mesh.uniform_buffer,
+                eye_offset(eye),
+                bytemuck::bytes_of(&Uniforms {
+                    view_proj: view_proj.to_cols_array_2d(),
+                }),
+            );
+        }
+    }
+
+    /// Records draw commands for one hand and eye into an existing render pass.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, hand: usize, eye: Eye) {
+        if let Some(mesh) = &self.models[hand] {
+            pass.set_pipeline(&self.pipeline.pipeline);
+            mesh.draw(pass, eye);
+        }
+    }
+}
+
 /// Byte offset of an eye's slot within the shared uniform buffer.
 fn eye_offset(eye: Eye) -> u64 {
     match eye {
@@ -528,10 +958,76 @@ pub enum CaptureKind {
     Depth,
 }
 
+/// The emulated devices drawn on top of whatever is behind them.
+///
+/// Grouped rather than passed one by one because the same set goes to the window's paint callback
+/// and to the offscreen captures, and the two must draw the same thing.
+#[derive(Default)]
+pub struct DeviceModels<'a> {
+    /// Per hand, a controller's world-space model matrix when its model should be drawn.
+    pub controllers: Option<(&'a ControllerRenderer, [Option<Mat4>; 2])>,
+    /// Per hand, the world-space skinning matrices when a hand model should be drawn.
+    pub hands: Option<(&'a HandRenderer, [Option<&'a [Mat4]>; 2])>,
+}
+
+impl DeviceModels<'_> {
+    /// Uploads the per-eye matrices, and the hand poses, which do not depend on the eye.
+    pub fn upload(&self, queue: &Queue, eye_views: [Mat4; 2], projection: Mat4) {
+        if let Some((renderer, poses)) = &self.hands {
+            for (hand, pose) in poses.iter().enumerate() {
+                if let Some(pose) = pose {
+                    renderer.set_pose(queue, hand, pose);
+                }
+            }
+        }
+
+        for (index, eye) in [Eye::Left, Eye::Right].into_iter().enumerate() {
+            let view_proj = projection * eye_views[index];
+
+            if let Some((renderer, models)) = &self.controllers {
+                for (hand, model) in models.iter().enumerate() {
+                    if let Some(model) = model {
+                        renderer.set_view(queue, hand, eye, view_proj * *model);
+                    }
+                }
+            }
+
+            if let Some((renderer, poses)) = &self.hands {
+                for (hand, pose) in poses.iter().enumerate() {
+                    if pose.is_some() {
+                        // The hand's own transform is already in its skinning matrices, so this is
+                        // the view and projection alone.
+                        renderer.set_view(queue, hand, eye, view_proj);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Records the draw commands for one eye. The caller has already drawn what is behind them.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, eye: Eye) {
+        if let Some((renderer, models)) = &self.controllers {
+            for (hand, model) in models.iter().enumerate() {
+                if model.is_some() {
+                    renderer.draw(pass, hand, eye);
+                }
+            }
+        }
+
+        if let Some((renderer, poses)) = &self.hands {
+            for (hand, pose) in poses.iter().enumerate() {
+                if pose.is_some() {
+                    renderer.draw(pass, hand, eye);
+                }
+            }
+        }
+    }
+}
+
 /// Renders both eyes side by side into an offscreen target and reads the result back.
 ///
-/// Visible controller models are drawn into the capture as well, so the endpoints show the same
-/// scene as the window. Each entry of the pose array is a controller's world-space model matrix.
+/// Visible controller and hand models are drawn into the capture as well, so the endpoints show
+/// the same scene as the window.
 ///
 /// Returns tightly packed pixels: RGBA8 for colour, or 8-bit greyscale for depth.
 #[expect(clippy::too_many_arguments)]
@@ -539,7 +1035,7 @@ pub fn capture_stereo(
     device: &Device,
     queue: &Queue,
     renderer: &SceneRenderer,
-    controllers: Option<(&ControllerRenderer, [Option<Mat4>; 2])>,
+    devices: &DeviceModels<'_>,
     camera: &Camera,
     eye_width: u32,
     eye_height: u32,
@@ -552,17 +1048,11 @@ pub fn capture_stereo(
     renderer.set_view(queue, camera, Eye::Left, aspect_ratio);
     renderer.set_view(queue, camera, Eye::Right, aspect_ratio);
 
-    if let Some((controller_renderer, models)) = &controllers {
-        for eye in [Eye::Left, Eye::Right] {
-            let view_proj = Camera::projection_matrix(aspect_ratio) * camera.view_matrix(eye);
-
-            for (hand, model) in models.iter().enumerate() {
-                if let Some(model) = model {
-                    controller_renderer.set_view(queue, hand, eye, view_proj * *model);
-                }
-            }
-        }
-    }
+    devices.upload(
+        queue,
+        [camera.view_matrix(Eye::Left), camera.view_matrix(Eye::Right)],
+        Camera::projection_matrix(aspect_ratio),
+    );
 
     let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("capture encoder"),
@@ -609,14 +1099,7 @@ pub fn capture_stereo(
             );
 
             renderer.draw(&mut pass, eye);
-
-            if let Some((controller_renderer, models)) = &controllers {
-                for (hand, model) in models.iter().enumerate() {
-                    if model.is_some() {
-                        controller_renderer.draw(&mut pass, hand, eye);
-                    }
-                }
-            }
+            devices.draw(&mut pass, eye);
         }
     }
 
