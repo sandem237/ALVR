@@ -120,6 +120,53 @@ fn to_ffi_skeleton(skeleton: &[Pose; 31]) -> FfiHandSkeleton {
     }
 }
 
+/// Where the interaction tip belongs relative to the device pose, in the device's own frame.
+///
+/// The device pose the driver publishes is bone 0 of the skeleton below: the OpenXR palm joint with
+/// the configured offset applied. The palm is defined at the centre of the *middle* finger's
+/// metacarpal, so anything drawn at the device pose — SteamVR's pointer ray, its poke cursor, the
+/// hand profile's render model — appears at the middle finger rather than the index. The profile
+/// declares `/pose/tip` for exactly this, and this places it where the index finger points.
+///
+/// Rigid with the hand, by construction. The spec asks for an aim pose that is "typically
+/// stabilized", and neither its origin nor its direction may follow the finger's articulation: if
+/// they did, a pinch would move the aim off whatever the user was pointing at, at the moment they
+/// commit to clicking it. So the origin is the fingertip's *extended* position, from the knuckle
+/// and the bone lengths, and the orientation stays the device's, which the rotation offset already
+/// aligns with the index finger.
+pub fn hand_tip_offset(
+    config: &HeadsetConfig,
+    device_id: u64,
+    hand_skeleton: &[Pose; 26],
+) -> [f32; 3] {
+    let (left_offset, right_offset) = get_hand_skeleton_offsets(config);
+    let pose_offset = if device_id == *HAND_LEFT_ID {
+        left_offset
+    } else {
+        right_offset
+    };
+
+    let palm = hand_skeleton[0];
+
+    // Where the index fingertip would be if the finger were extended, built only from quantities
+    // that do not move when it is not. The metacarpal does not articulate, so its base and the
+    // knuckle are rigid with the palm, and the three phalanx lengths are fixed whatever the finger
+    // is doing. Taking the live fingertip instead drags the aim about as the finger curls, so a
+    // pinch walks the target off the thing you were pointing at.
+    let index_metacarpal = hand_skeleton[6].position;
+    let knuckle = hand_skeleton[7].position;
+    let length = (hand_skeleton[8].position - hand_skeleton[7].position).length()
+        + (hand_skeleton[9].position - hand_skeleton[8].position).length()
+        + (hand_skeleton[10].position - hand_skeleton[9].position).length();
+    let extended = knuckle + (knuckle - index_metacarpal).normalize_or_zero() * length;
+
+    // Must match bone 0 below, or the tip lands somewhere unrelated to where the device is.
+    let device_orientation = palm.orientation * pose_offset.orientation;
+    let device_position = palm.position + device_orientation * pose_offset.position;
+
+    (device_orientation.conjugate() * (extended - device_position)).to_array()
+}
+
 pub fn to_openvr_ffi_hand_skeleton(
     config: &HeadsetConfig,
     device_id: u64,

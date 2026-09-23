@@ -255,6 +255,7 @@ dependencies = [
  "egui-wgpu",
  "env_logger",
  "ffmpeg-next",
+ "gltf",
  "image",
  "pollster",
  "rand 0.10.1",

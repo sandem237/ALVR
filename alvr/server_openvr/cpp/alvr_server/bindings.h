@@ -41,6 +41,14 @@ struct FfiHandData {
     const FfiHandSkeleton* handSkeleton;
     bool isHandTracker;
     bool predictHandSkeleton;
+    // Where the interaction tip sits relative to the device pose, in the device's own frame.
+    // SteamVR's hand interaction profile declares /pose/tip and its render model is parented to it,
+    // so this is what the pointer ray and the poke cursor come out of. Without it SteamVR falls
+    // back to the raw device pose, which is the OpenXR palm joint: the centre of the *middle*
+    // finger's metacarpal, so the pointer appears at the middle finger. Only meaningful when
+    // handSkeleton is set.
+    float tipOffsetPosition[3];
+    bool hasTipOffset;
 };
 
 enum FfiOpenvrPropertyType {

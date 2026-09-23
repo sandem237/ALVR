@@ -958,6 +958,292 @@ pub enum CaptureKind {
     Depth,
 }
 
+/// Devices that can carry a debug gizmo at once: a pose per hand and per controller.
+///
+/// Slots rather than a list so the renderer's buffers are allocated once. Hands take 0 and 1,
+/// controllers 2 and 3; [`GizmoRenderer::slot`] is the only place that mapping is written down.
+pub const GIZMO_SLOTS: usize = 4;
+
+/// What a gizmo is drawn for. Hands and controllers each choose their own pose, independently.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GizmoDevice {
+    Hand,
+    /// Not yet selected anywhere: the controller dropdown is the next step, and its slots are
+    /// already reserved so adding it needs no change here.
+    #[expect(dead_code, reason = "reserved for the controller pose selector")]
+    Controller,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GizmoVertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+/// How long an axis is drawn, in metres. Sized against a hand: long enough to read the direction
+/// off, short enough that three of them at a fingertip do not swamp the hand itself.
+const AXIS_LENGTH: f32 = 0.05;
+const SHAFT_RADIUS: f32 = 0.0022;
+const HEAD_RADIUS: f32 = 0.006;
+/// Fraction of the axis taken by the arrowhead.
+const HEAD_FRACTION: f32 = 0.28;
+
+/// The unit gizmo: three arrows along +X, +Y and +Z, coloured red, green and blue.
+///
+/// Arrowheads rather than plain bars because an axis has a sign, and a bar drawn from the origin
+/// only tells you the sign if you can already see where the origin is — which, inside a fist, you
+/// cannot.
+fn axes_mesh() -> (Vec<GizmoVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    for (axis, color) in [
+        (0, [1.0, 0.15, 0.15]),
+        (1, [0.15, 0.9, 0.2]),
+        (2, [0.25, 0.4, 1.0]),
+    ] {
+        // Local frame for this axis: the offset closure places a vertex `t` along it and `u`, `v`
+        // across its square section. Which of the other two axes is which does not matter.
+        let offset = |t: f32, u: f32, v: f32| {
+            let mut position = [0.0f32; 3];
+            position[axis] = t;
+            position[(axis + 1) % 3] = u;
+            position[(axis + 2) % 3] = v;
+
+            GizmoVertex { position, color }
+        };
+
+        let shaft_end = AXIS_LENGTH * (1.0 - HEAD_FRACTION);
+        let base = vertices.len() as u32;
+
+        // Square shaft: the four corners at the origin, then the four at the head.
+        for t in [0.0, shaft_end] {
+            for (u, v) in [
+                (-SHAFT_RADIUS, -SHAFT_RADIUS),
+                (SHAFT_RADIUS, -SHAFT_RADIUS),
+                (SHAFT_RADIUS, SHAFT_RADIUS),
+                (-SHAFT_RADIUS, SHAFT_RADIUS),
+            ] {
+                vertices.push(offset(t, u, v));
+            }
+        }
+
+        for corner in 0..4u32 {
+            let next = (corner + 1) % 4;
+            indices.extend([
+                base + corner,
+                base + next,
+                base + 4 + next,
+                base + corner,
+                base + 4 + next,
+                base + 4 + corner,
+            ]);
+        }
+
+        // Pyramid head: a square base at the end of the shaft rising to a point on the axis.
+        let head = vertices.len() as u32;
+        for (u, v) in [
+            (-HEAD_RADIUS, -HEAD_RADIUS),
+            (HEAD_RADIUS, -HEAD_RADIUS),
+            (HEAD_RADIUS, HEAD_RADIUS),
+            (-HEAD_RADIUS, HEAD_RADIUS),
+        ] {
+            vertices.push(offset(shaft_end, u, v));
+        }
+        vertices.push(offset(AXIS_LENGTH, 0.0, 0.0));
+
+        for corner in 0..4u32 {
+            let next = (corner + 1) % 4;
+            indices.extend([head + corner, head + next, head + 4]);
+
+            // Base of the pyramid, so the head is solid seen from behind.
+            if corner < 2 {
+                indices.extend([head, head + corner + 1, head + corner + 2]);
+            }
+        }
+    }
+
+    (vertices, indices)
+}
+
+/// Draws coordinate axes at a pose, for reading off where an interaction pose actually is.
+///
+/// Deliberately drawn over everything, depth test and all. Grip sits *inside* the fist and poke on
+/// the surface of a fingertip, so a depth-tested gizmo would be hidden exactly when it matters.
+pub struct GizmoRenderer {
+    pipeline: RenderPipeline,
+    vertices: Buffer,
+    indices: Buffer,
+    index_count: u32,
+    uniforms: Buffer,
+    bind_group: BindGroup,
+}
+
+impl GizmoRenderer {
+    pub fn new(device: &Device, queue: &Queue, output_format: TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::include_wgsl!("gizmo.wgsl"));
+
+        let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("gizmo bind group layout"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("gizmo pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("gizmo pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GizmoVertex>() as u64,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            format: VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        VertexAttribute {
+                            format: VertexFormat::Float32x3,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format: output_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                // The arrows are generated without consistent winding and are solid, so culling
+                // would drop half of each one.
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let (vertices, indices) = axes_mesh();
+
+        let vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("gizmo vertices"),
+            size: (vertices.len() * std::mem::size_of::<GizmoVertex>()) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+        let index_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("gizmo indices"),
+            size: (indices.len() * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
+
+        // One slot per device per eye, so a stereo pass draws both without rewriting between them.
+        let uniforms = device.create_buffer(&BufferDescriptor {
+            label: Some("gizmo uniforms"),
+            size: UNIFORM_STRIDE * (GIZMO_SLOTS * 2) as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("gizmo bind group"),
+            layout: &bind_group_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &uniforms,
+                    offset: 0,
+                    size: Some(
+                        std::num::NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64).unwrap(),
+                    ),
+                }),
+            }],
+        });
+
+        Self {
+            pipeline,
+            vertices: vertex_buffer,
+            indices: index_buffer,
+            index_count: indices.len() as u32,
+            uniforms,
+            bind_group,
+        }
+    }
+
+    /// Which slot a device's gizmo lives in. The one place the slot layout is defined.
+    pub fn slot(device: GizmoDevice, hand: usize) -> usize {
+        match device {
+            GizmoDevice::Hand => hand,
+            GizmoDevice::Controller => 2 + hand,
+        }
+    }
+
+    fn offset(slot: usize, eye: Eye) -> u64 {
+        UNIFORM_STRIDE * (slot * 2 + eye as usize) as u64
+    }
+
+    /// Uploads the combined matrix (projection * view * pose) for one slot and eye.
+    pub fn set_view(&self, queue: &Queue, slot: usize, eye: Eye, matrix: Mat4) {
+        queue.write_buffer(
+            &self.uniforms,
+            Self::offset(slot, eye),
+            bytemuck::bytes_of(&Uniforms {
+                view_proj: matrix.to_cols_array_2d(),
+            }),
+        );
+    }
+
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, slot: usize, eye: Eye) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[Self::offset(slot, eye) as u32]);
+        pass.set_vertex_buffer(0, self.vertices.slice(..));
+        pass.set_index_buffer(self.indices.slice(..), IndexFormat::Uint32);
+        pass.draw_indexed(0..self.index_count, 0, 0..1);
+    }
+}
+
 /// The emulated devices drawn on top of whatever is behind them.
 ///
 /// Grouped rather than passed one by one because the same set goes to the window's paint callback
@@ -968,6 +1254,12 @@ pub struct DeviceModels<'a> {
     pub controllers: Option<(&'a ControllerRenderer, [Option<Mat4>; 2])>,
     /// Per hand, the world-space skinning matrices when a hand model should be drawn.
     pub hands: Option<(&'a HandRenderer, [Option<&'a [Mat4]>; 2])>,
+    /// Per slot, the world-space transform of a debug pose gizmo; see [`GizmoRenderer::slot`].
+    ///
+    /// Independent of the model entries above: a gizmo is drawn for an enabled device whether or
+    /// not its model is being displayed, since hiding the hand to see the pose underneath is
+    /// exactly what the display toggle is for.
+    pub gizmos: Option<(&'a GizmoRenderer, [Option<Mat4>; GIZMO_SLOTS])>,
 }
 
 impl DeviceModels<'_> {
@@ -1001,6 +1293,14 @@ impl DeviceModels<'_> {
                     }
                 }
             }
+
+            if let Some((renderer, transforms)) = &self.gizmos {
+                for (slot, transform) in transforms.iter().enumerate() {
+                    if let Some(transform) = transform {
+                        renderer.set_view(queue, slot, eye, view_proj * *transform);
+                    }
+                }
+            }
         }
     }
 
@@ -1018,6 +1318,15 @@ impl DeviceModels<'_> {
             for (hand, pose) in poses.iter().enumerate() {
                 if pose.is_some() {
                     renderer.draw(pass, hand, eye);
+                }
+            }
+        }
+
+        // Last, and over the top of the models: a gizmo inside a fist has to stay readable.
+        if let Some((renderer, transforms)) = &self.gizmos {
+            for (slot, transform) in transforms.iter().enumerate() {
+                if transform.is_some() {
+                    renderer.draw(pass, slot, eye);
                 }
             }
         }

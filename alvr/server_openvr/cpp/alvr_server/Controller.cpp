@@ -58,6 +58,14 @@ bool Controller::activate() {
         vr::VRScalarUnits_NormalizedOneSided
     );
 
+    // The hand interaction profile declares /pose/tip and parents its render model to it, so it is
+    // what SteamVR draws the pointer ray and the poke cursor from. Nothing creates it otherwise and
+    // SteamVR falls back to the raw device pose, which is the OpenXR palm joint — the middle
+    // finger's metacarpal. Controllers are left alone: their own profiles define a tip already.
+    if (isHandTracker()) {
+        vr_driver_input->CreatePoseComponent(this->prop_container, "/pose/tip", &m_compTip);
+    }
+
     if (this->device_id == HAND_LEFT_ID || this->device_id == HAND_TRACKER_LEFT_ID) {
         vr_driver_input->CreateSkeletonComponent(
             this->prop_container,
@@ -281,6 +289,22 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
     pose.poseTimeOffset = predictionS;
 
     this->submit_pose(pose);
+
+    // Place the tip at the index fingertip, as an offset from the device pose in its own frame.
+    // Position only: the identity rotation leaves the tip pointing where the device does, which the
+    // rotation offset setting already aligns with the index finger. Deriving a direction from the
+    // finger joints would make the ray swing about as the fingers curl.
+    if (m_compTip != vr::k_ulInvalidInputComponentHandle && enabled && handData.hasTipOffset) {
+        vr::HmdMatrix34_t tip = {};
+        tip.m[0][0] = 1.f;
+        tip.m[1][1] = 1.f;
+        tip.m[2][2] = 1.f;
+        tip.m[0][3] = handData.tipOffsetPosition[0];
+        tip.m[1][3] = handData.tipOffsetPosition[1];
+        tip.m[2][3] = handData.tipOffsetPosition[2];
+
+        vr_driver_input->UpdatePoseComponent(m_compTip, &tip, predictionS);
+    }
 
     m_poseTargetTimestampNs = targetTimestampNs;
 

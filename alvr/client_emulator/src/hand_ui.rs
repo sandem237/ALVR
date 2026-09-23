@@ -11,11 +11,12 @@
 use crate::{
     controllers::{ControllerState, Hand},
     hands::{self, Finger, HandPose, HandSettings, HandState},
+    interaction::HandInteraction,
     overlay::{hand_color, input_tooltip},
 };
 use alvr_common::glam::Vec3;
 use eframe::egui::{
-    Align2, Color32, Context, CornerRadius, FontId, Id, Order, Rect, Sense, Stroke, StrokeKind, Ui,
+    self, Align2, Color32, Context, CornerRadius, FontId, Id, Order, Rect, Sense, Stroke, StrokeKind, Ui,
     Vec2, pos2, vec2,
 };
 use std::time::Instant;
@@ -42,6 +43,7 @@ pub fn toolbar_row(
     hands: &mut [HandState; 2],
     controllers: &mut [ControllerState; 2],
     settings: &HandSettings,
+    gizmo: &mut Option<HandInteraction>,
 ) {
     ui.label("Hand:");
 
@@ -68,11 +70,39 @@ pub fn toolbar_row(
         }
     }
 
+    pose_gizmo_selector(ui, gizmo);
+
     if ui.button("Reset").clicked() {
         for hand in Hand::BOTH {
             hands[hand.index()].reset(settings, hand);
         }
     }
+}
+
+/// The interaction pose to draw axes at, or nothing, which is the default.
+///
+/// A debugging aid rather than part of the emulation: applications see poses, not joints, and the
+/// derivations from one to the other are where this project's bugs have lived. One selection drives
+/// both hands, so the two are always shown together and a sign error that mirrors is obvious.
+fn pose_gizmo_selector(ui: &mut Ui, gizmo: &mut Option<HandInteraction>) {
+    let label = gizmo.map_or("Pose: off", |pose| pose.label());
+
+    egui::ComboBox::from_id_salt("hand pose gizmo")
+        .selected_text(label)
+        .width(84.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(gizmo, None, "off")
+                .on_hover_text("Draw no pose axes.");
+
+            for pose in HandInteraction::ALL {
+                ui.selectable_value(gizmo, Some(pose), pose.label())
+                    .on_hover_text(pose.describe());
+            }
+        })
+        .response
+        .on_hover_text(
+            "Draw an OpenXR interaction pose as RGB axes on both hands: X red, Y green, Z blue.",
+        );
 }
 
 /// Draws each enabled hand's panel in its bottom corner and applies any selection.

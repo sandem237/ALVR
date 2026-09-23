@@ -19,6 +19,7 @@ mod controllers;
 mod decoder;
 mod hand_ui;
 mod hands;
+mod interaction;
 mod overlay;
 mod render;
 mod scene;
@@ -39,9 +40,12 @@ use crate::{
     controller_ui::ControllerUi,
     controllers::{ControllerSettings, ControllerState, Hand},
     hands::{HandSettings, HandState},
+    interaction::HandInteraction,
     overlay::{PoseOverlay, PoseTarget, Slot},
-    render::{CaptureKind, ControllerRenderer, DeviceModels, HandRenderer, HandTint, SceneRenderer,
-        capture_stereo},
+    render::{
+        CaptureKind, ControllerRenderer, DeviceModels, GIZMO_SLOTS, GizmoDevice, GizmoRenderer,
+        HandRenderer, HandTint, SceneRenderer, capture_stereo,
+    },
     scene::Scene,
     skinned::SkinnedModel,
     video::{FrameLayout, VideoRenderer},
@@ -136,6 +140,9 @@ struct EmulatorApp {
     /// Whether loading a hand model has been attempted, so a missing file is reported once rather
     /// than every frame.
     hand_models_tried: [bool; 2],
+    /// Which interaction pose to draw axes at on every enabled hand, if any. One selection for
+    /// both hands: the poses are mirror images, so seeing them side by side is the comparison.
+    hand_gizmo: Option<HandInteraction>,
 }
 
 impl EmulatorApp {
@@ -236,6 +243,7 @@ impl EmulatorApp {
             timed_releases: Vec::new(),
             loaded_models: [None, None],
             hand_models: [None, None],
+            hand_gizmo: None,
             hand_models_tried: [false; 2],
         }
     }
@@ -625,6 +633,42 @@ impl EmulatorApp {
     ///
     /// Profiles name an optional glTF file; without one, or when loading fails, a procedural
     /// placeholder shows position and orientation instead.
+    /// Creates the gizmo renderer the first time a pose is selected for display.
+    ///
+    /// Lazy like the other renderers, and for the same reason: it costs a pipeline, and most runs
+    /// never draw a gizmo at all.
+    fn ensure_gizmo_renderer(&mut self, frame: &Frame) {
+        if self.hand_gizmo.is_none() {
+            return;
+        }
+
+        let Some(state) = frame.wgpu_render_state() else {
+            return;
+        };
+
+        if state
+            .renderer
+            .read()
+            .callback_resources
+            .get::<Arc<GizmoRenderer>>()
+            .is_some()
+        {
+            return;
+        }
+
+        let created = Arc::new(GizmoRenderer::new(
+            &state.device,
+            &state.queue,
+            state.target_format,
+        ));
+
+        state
+            .renderer
+            .write()
+            .callback_resources
+            .insert(Arc::clone(&created));
+    }
+
     fn ensure_controller_models(&mut self, frame: &Frame) {
         let Some(state) = frame.wgpu_render_state() else {
             return;
@@ -725,6 +769,44 @@ impl EmulatorApp {
                     .collect(),
             )
         })
+    }
+
+    /// World transforms of the debug pose gizmos, one slot per device; see [`GizmoRenderer::slot`].
+    ///
+    /// Placed against the same head pose the models are, so a gizmo sits on the hand it belongs to
+    /// rather than drifting against it over the video. Drawn for any *enabled* device, whether or
+    /// not its model is shown: turning the hand off to see the pose inside it is the point.
+    fn gizmo_transforms(
+        &self,
+        head_position: Vec3,
+        head_orientation: Quat,
+    ) -> [Option<Mat4>; GIZMO_SLOTS] {
+        let mut transforms = [None; GIZMO_SLOTS];
+
+        if let Some(interaction) = self.hand_gizmo {
+            for hand in Hand::BOTH {
+                let index = hand.index();
+                let state = &self.hands[index];
+
+                if !state.enabled {
+                    continue;
+                }
+
+                let joints = state.local_skeleton(&self.hand_settings, hand);
+                let pose = interaction.transform(&joints, hand);
+
+                let palm = Mat4::from_rotation_translation(
+                    (head_orientation * state.orientation).normalize(),
+                    head_position + head_orientation * state.position,
+                );
+
+                transforms[GizmoRenderer::slot(GizmoDevice::Hand, index)] = Some(
+                    palm * Mat4::from_rotation_translation(pose.orientation, pose.position),
+                );
+            }
+        }
+
+        transforms
     }
 
     /// Loads the hand models and uploads them to the GPU, once, when a hand is first shown.
@@ -1010,11 +1092,18 @@ impl EmulatorApp {
             .callback_resources
             .get::<Arc<Mutex<HandRenderer>>>()
             .cloned();
+        let gizmo_renderer = state
+            .renderer
+            .read()
+            .callback_resources
+            .get::<Arc<GizmoRenderer>>()
+            .cloned();
         // Captures render the scene live, so the live camera is the right head pose here.
         let controller_models =
             self.controller_model_matrices(self.camera.position, self.camera.orientation());
         let hand_poses =
             self.hand_joint_matrices(self.camera.position, self.camera.orientation());
+        let gizmos = self.gizmo_transforms(self.camera.position, self.camera.orientation());
 
         // Capture at the negotiated stream resolution when streaming, so captures are deterministic
         // and independent of the window size.
@@ -1046,6 +1135,9 @@ impl EmulatorApp {
                         }),
                     )
                 }),
+                gizmos: gizmo_renderer
+                    .as_ref()
+                    .map(|renderer| (&**renderer, gizmos)),
             };
 
             let pixels = capture_stereo(
@@ -1232,6 +1324,7 @@ impl EmulatorApp {
                 &mut self.hands,
                 &mut self.controllers,
                 &self.hand_settings,
+                &mut self.hand_gizmo,
             );
 
             let controllers = self.controllers.iter().any(|state| state.enabled);
@@ -1285,6 +1378,7 @@ impl App for EmulatorApp {
 
         self.ensure_controller_models(frame);
         self.ensure_hand_models(frame);
+        self.ensure_gizmo_renderer(frame);
         let displayed_frame = self.upload_decoded_frame(frame);
         // The world-space eye poses the displayed frame was rendered with. Also reports the
         // compositor start for the frame pacing statistics.
@@ -1328,6 +1422,7 @@ impl App for EmulatorApp {
         let controller_models =
             self.controller_model_matrices(overlay_position, overlay_orientation);
         let hand_poses = self.hand_joint_matrices(overlay_position, overlay_orientation);
+        let gizmos = self.gizmo_transforms(overlay_position, overlay_orientation);
         let mut look_requested = LookRequest::None;
 
         let view_rect = egui::CentralPanel::default()
@@ -1370,6 +1465,7 @@ impl App for EmulatorApp {
                         controller_models,
                         hand_poses,
                         device_eye_views: overlay_eye_views,
+                        gizmos,
                     },
                 ));
 
@@ -1553,6 +1649,8 @@ struct ViewportCallback {
     /// Per-eye view matrices the device models are drawn with: the displayed video frame's eye
     /// poses in video mode, the live camera's in scene mode. Left is index 0.
     device_eye_views: [Mat4; 2],
+    /// World transforms of the debug pose gizmos, empty unless one is selected in the toolbar.
+    gizmos: [Option<Mat4>; GIZMO_SLOTS],
 }
 
 impl ViewportCallback {
@@ -1564,6 +1662,7 @@ impl ViewportCallback {
         &'resources self,
         controllers: Option<&'resources ControllerRenderer>,
         hands: Option<&'resources HandRenderer>,
+        gizmos: Option<&'resources GizmoRenderer>,
     ) -> DeviceModels<'resources> {
         DeviceModels {
             controllers: controllers.map(|renderer| (renderer, self.controller_models)),
@@ -1575,6 +1674,7 @@ impl ViewportCallback {
                     }),
                 )
             }),
+            gizmos: gizmos.map(|renderer| (renderer, self.gizmos)),
         }
     }
 }
@@ -1627,10 +1727,12 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
 
         let controllers = resources.get::<Arc<Mutex<ControllerRenderer>>>().map(|r| r.lock());
         let hands = resources.get::<Arc<Mutex<HandRenderer>>>().map(|r| r.lock());
+        let gizmos = resources.get::<Arc<GizmoRenderer>>();
 
         self.devices(
             controllers.as_deref(),
             hands.as_deref(),
+            gizmos.map(|renderer| &**renderer),
         )
         .upload(
             queue,
@@ -1664,7 +1766,12 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         let scene = resources.get::<Arc<SceneRenderer>>();
         let controllers = resources.get::<Arc<Mutex<ControllerRenderer>>>().map(|r| r.lock());
         let hands = resources.get::<Arc<Mutex<HandRenderer>>>().map(|r| r.lock());
-        let devices = self.devices(controllers.as_deref(), hands.as_deref());
+        let gizmos = resources.get::<Arc<GizmoRenderer>>();
+        let devices = self.devices(
+            controllers.as_deref(),
+            hands.as_deref(),
+            gizmos.map(|renderer| &**renderer),
+        );
 
         if video.is_none() && scene.is_none() {
             return;

@@ -361,6 +361,8 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                         let (
                             ffi_left_hand_skeleton,
                             ffi_right_hand_skeleton,
+                            left_tip_offset,
+                            right_tip_offset,
                             use_separate_hand_trackers,
                             predict_hand_skeleton,
                         ) = if let Some(ControllersConfig {
@@ -368,33 +370,45 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                             ..
                         }) = controllers_config
                         {
-                            let left_hand_skeleton = context
-                                .get_hand_skeleton(HandType::Left, poll_timestamp)
-                                .map(|s| {
-                                    tracking::to_openvr_ffi_hand_skeleton(
-                                        headset_config,
-                                        *HAND_LEFT_ID,
-                                        &s,
-                                    )
-                                });
-                            let right_hand_skeleton = context
-                                .get_hand_skeleton(HandType::Right, poll_timestamp)
-                                .map(|s| {
-                                    tracking::to_openvr_ffi_hand_skeleton(
-                                        headset_config,
-                                        *HAND_RIGHT_ID,
-                                        &s,
-                                    )
-                                });
+                            let left_skeleton =
+                                context.get_hand_skeleton(HandType::Left, poll_timestamp);
+                            let right_skeleton =
+                                context.get_hand_skeleton(HandType::Right, poll_timestamp);
+
+                            let left_hand_skeleton = left_skeleton.as_ref().map(|s| {
+                                tracking::to_openvr_ffi_hand_skeleton(
+                                    headset_config,
+                                    *HAND_LEFT_ID,
+                                    s,
+                                )
+                            });
+                            let right_hand_skeleton = right_skeleton.as_ref().map(|s| {
+                                tracking::to_openvr_ffi_hand_skeleton(
+                                    headset_config,
+                                    *HAND_RIGHT_ID,
+                                    s,
+                                )
+                            });
+
+                            // Taken from the same skeleton sample as the bones, so the tip cannot
+                            // describe a different frame from the hand it belongs to.
+                            let left_tip = left_skeleton.as_ref().map(|s| {
+                                tracking::hand_tip_offset(headset_config, *HAND_LEFT_ID, s)
+                            });
+                            let right_tip = right_skeleton.as_ref().map(|s| {
+                                tracking::hand_tip_offset(headset_config, *HAND_RIGHT_ID, s)
+                            });
 
                             (
                                 tracked.then_some(left_hand_skeleton).flatten(),
                                 tracked.then_some(right_hand_skeleton).flatten(),
+                                tracked.then_some(left_tip).flatten(),
+                                tracked.then_some(right_tip).flatten(),
                                 hand_skeleton_config.steamvr_input_2_0,
                                 hand_skeleton_config.predict,
                             )
                         } else {
-                            (None, None, false, false)
+                            (None, None, None, None, false, false)
                         };
 
                         let ffi_left_hand_data = FfiHandData {
@@ -412,6 +426,8 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                                 && ffi_left_controller_motion.is_none()
                                 && ffi_left_hand_skeleton.is_some(),
                             predictHandSkeleton: predict_hand_skeleton,
+                            tipOffsetPosition: left_tip_offset.unwrap_or([0.0; 3]),
+                            hasTipOffset: left_tip_offset.is_some(),
                         };
                         let ffi_right_hand_data = FfiHandData {
                             controllerMotion: if let Some(motion) = &ffi_right_controller_motion {
@@ -428,6 +444,8 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                                 && ffi_right_controller_motion.is_none()
                                 && ffi_right_hand_skeleton.is_some(),
                             predictHandSkeleton: predict_hand_skeleton,
+                            tipOffsetPosition: right_tip_offset.unwrap_or([0.0; 3]),
+                            hasTipOffset: right_tip_offset.is_some(),
                         };
 
                         let ffi_body_tracker_motions = if track_body || detached_controllers {

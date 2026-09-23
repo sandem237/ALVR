@@ -24,6 +24,9 @@ private:
 
     vr::VRInputComponentHandle_t m_compHaptic;
     vr::VRInputComponentHandle_t m_compSkeleton = vr::k_ulInvalidInputComponentHandle;
+    // /pose/tip on the hand tracking devices: where the profile's render model, the pointer ray and
+    // the poke cursor are drawn. Left invalid on controllers, whose profiles define their own tip.
+    vr::VRInputComponentHandle_t m_compTip = vr::k_ulInvalidInputComponentHandle;
     vr::EVRSkeletalTrackingLevel m_skeletonLevel;
 
     uint64_t m_poseTargetTimestampNs;

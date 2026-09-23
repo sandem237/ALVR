@@ -1142,6 +1142,13 @@ fn default_gestures() -> Vec<GestureEntry> {
     ]
 }
 
+/// Settings as they load with no `hands.json` present, for tests elsewhere in the crate that need
+/// a hand to pose without reaching into this module's internals.
+#[cfg(test)]
+pub(crate) fn default_settings() -> HandSettings {
+    resolve(default_file(), Path::new("."))
+}
+
 fn resolve(file: SettingsFile, directory: &Path) -> HandSettings {
     let poses: Vec<NamedPose> = file
         .poses
@@ -1291,6 +1298,58 @@ mod tests {
 
     fn distance(joints: &[Pose; JOINT_COUNT], a: usize, b: usize) -> f32 {
         joints[a].position.distance(joints[b].position)
+    }
+
+
+    /// The aim origin the driver derives must not move when the fingers do.
+    ///
+    /// `server_openvr`'s `tracking::hand_tip_offset` places SteamVR's `/pose/tip` — the origin of
+    /// the pointer ray and the poke cursor — at the index fingertip's *extended* position, built
+    /// from the knuckle and the bone lengths rather than the live fingertip. This mirrors that
+    /// construction against this model, because the failure it prevents is only visible end to end:
+    /// take the live fingertip instead and a pinch drags the aim off the target at the instant the
+    /// user commits to clicking it.
+    fn extended_index_tip(joints: &[Pose; JOINT_COUNT]) -> Vec3 {
+        let knuckle = joints[7].position;
+        let length = joints[7].position.distance(joints[8].position)
+            + joints[8].position.distance(joints[9].position)
+            + joints[9].position.distance(joints[10].position);
+
+        knuckle + (knuckle - joints[6].position).normalize() * length
+    }
+
+    #[test]
+    fn aim_origin_does_not_follow_the_fingers() {
+        for hand in [Hand::Left, Hand::Right] {
+            let reference = extended_index_tip(&joints("Point", hand));
+
+            for pose in ["Idle", "Grasp", "Point", "Pinch"] {
+                let joints = joints(pose, hand);
+                let drift = extended_index_tip(&joints).distance(reference);
+
+                assert!(
+                    drift < 1e-4,
+                    "{pose}: aim origin moved {:.1} mm from the pointing pose",
+                    drift * 1000.0
+                );
+
+                // The live fingertip is what this must not be, and the gap is the whole point:
+                // it is the distance the aim would jump between poses.
+                let live = joints[10].position.distance(reference);
+                let side = if hand == Hand::Left { "left " } else { "right" };
+                println!("{side} {pose:<6} live fingertip is {:.1} mm away", live * 1000.0);
+            }
+
+            // Pointing is when the aim has to be right: there the extended position and the real
+            // fingertip should agree closely.
+            let pointing = joints("Point", hand);
+            let error = pointing[10].position.distance(reference);
+            assert!(
+                error < 0.02,
+                "pointing: aim origin is {:.1} mm from the actual fingertip",
+                error * 1000.0
+            );
+        }
     }
 
     /// The hand is the size it says it is, and both hands are mirror images.
