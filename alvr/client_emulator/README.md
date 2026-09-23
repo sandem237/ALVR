@@ -217,6 +217,9 @@ emulation mode happens on the server, as with real hardware.
 
 ## Hand emulation
 
+> Implementation notes, the measurements behind the server settings below, and the dead ends are in
+> [`HAND-EMULATION.md`](HAND-EMULATION.md).
+
 The **Hand** section of the **Inputs** row mirrors the controller one: **L** and **R** enable each
 hand, **Display** shows the 3D models, **Reset** returns the pose and the gesture to their
 defaults. Hands are posed with the same icons and the same movement panel as controllers, and

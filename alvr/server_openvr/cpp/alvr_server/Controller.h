@@ -11,6 +11,9 @@ public:
     virtual ~Controller() {};
     void RegisterButton(uint64_t id);
     void SetButton(uint64_t id, FfiButtonValue value);
+    /// Whether this is one of the separate hand tracking devices rather than a controller, which
+    /// decides which input profile's components it publishes.
+    bool isHandTracker() const;
     bool OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, FfiHandData handData);
 
 private:

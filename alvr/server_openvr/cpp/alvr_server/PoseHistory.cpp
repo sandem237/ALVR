@@ -55,7 +55,13 @@ PoseHistory::GetBestPoseMatch(const vr::HmdMatrix34_t& pose) const {
                 distance += pow(it->rotationMatrix.m[j][i] - pose.m[j][i], 2);
             }
         }
-        if (minDiff > distance) {
+        // `>=` rather than `>` so a tie keeps the newest sample. The buffer is iterated oldest
+        // to newest and compares rotation only, so a head that is not rotating makes every entry
+        // tie and the oldest wins, resolving the frame to a pose up to the buffer's whole length
+        // old. That inflates the reported game time to about a second, which trips the prediction
+        // clamp and the frame is dropped: video then only advances while the view is turning.
+        // A real headset is saved from this by sensor noise, not by anything here.
+        if (minDiff >= distance) {
             minIt = it;
             minDiff = distance;
         }

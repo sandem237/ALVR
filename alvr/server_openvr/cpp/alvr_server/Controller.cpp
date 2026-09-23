@@ -106,11 +106,22 @@ bool Controller::activate() {
 
 vr::VRInputComponentHandle_t Controller::getHapticComponent() { return m_compHaptic; }
 
+bool Controller::isHandTracker() const {
+    return this->device_id == HAND_TRACKER_LEFT_ID || this->device_id == HAND_TRACKER_RIGHT_ID;
+}
+
 void Controller::RegisterButton(uint64_t id) {
     Debug("Controller::RegisterButton deviceID=%llu", this->device_id);
 
+    bool left = this->device_id == HAND_LEFT_ID || this->device_id == HAND_TRACKER_LEFT_ID;
+
+    // A hand tracking device advertises the hand interaction profile, so its components are that
+    // profile's, not the emulated controller's; an id with no entry there creates nothing.
     ButtonInfo buttonInfo;
-    if (device_id == HAND_LEFT_ID) {
+    if (isHandTracker()) {
+        buttonInfo = left ? LEFT_HAND_TRACKER_BUTTON_MAPPING[id]
+                          : RIGHT_HAND_TRACKER_BUTTON_MAPPING[id];
+    } else if (left) {
         buttonInfo = LEFT_CONTROLLER_BUTTON_MAPPING[id];
     } else {
         buttonInfo = RIGHT_CONTROLLER_BUTTON_MAPPING[id];
@@ -146,7 +157,11 @@ void Controller::SetButton(uint64_t id, FfiButtonValue value) {
         return;
     }
 
-    for (auto id : ALVR_TO_STEAMVR_PATH_IDS[id]) {
+    // Resolved against the same table the components were created from, or the update would look
+    // for handles this device never registered.
+    auto& path_ids = isHandTracker() ? ALVR_TO_HAND_TRACKER_PATH_IDS : ALVR_TO_STEAMVR_PATH_IDS;
+
+    for (auto id : path_ids[id]) {
         if (value.type == BUTTON_TYPE_BINARY) {
             vr::VRDriverInput()->UpdateBooleanComponent(
                 m_buttonHandles[id], (bool)value.binary, 0.0
